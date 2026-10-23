@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -33,18 +32,16 @@ import (
 // fully-capitalized days of the week (e.g., "Monday", "Tuesday").
 // It returns an error if any unrecognized or incorrectly formatted days are found.
 func WeekdaysValid(days []string) error {
-	validWeekdays := []string{
-		time.Sunday.String(),
-		time.Monday.String(),
-		time.Tuesday.String(),
-		time.Wednesday.String(),
-		time.Thursday.String(),
-		time.Friday.String(),
-		time.Saturday.String(),
-	}
+	validWeekdays := AllWeekdays()
 
-	if !IsSubset(days, validWeekdays) {
-		return fmt.Errorf("daysOfWeek contains invalid days, valid days are: %v, got %v", validWeekdays, days)
+	var invalid []string
+	for _, d := range days {
+		if !slices.Contains(validWeekdays, d) {
+			invalid = append(invalid, d)
+		}
+	}
+	if len(invalid) > 0 {
+		return fmt.Errorf("`daysOfWeek` must only contain %s, got %s", QuotedList(validWeekdays), QuotedList(invalid))
 	}
 
 	return nil
@@ -56,11 +53,18 @@ func WeekdaysValid(days []string) error {
 // "Local" is explicitly rejected because it resolves to the controller container's
 // local timezone.
 func TimeZoneValid(timeZone string) bool {
-	if strings.EqualFold(timeZone, "Local") {
+	if isLocalTimeZone(timeZone) {
 		return false
 	}
 	_, err := time.LoadLocation(timeZone)
 	return err == nil
+}
+
+// isLocalTimeZone returns true if timeZone is exactly "Local" or "local", matching the CRD CEL rule on
+// DisruptionWindow.timeZone. The comparison is deliberately case-sensitive, because the Kubernetes API
+// conventions forbid case-insensitive comparisons in validation.
+func isLocalTimeZone(timeZone string) bool {
+	return timeZone == "Local" || timeZone == "local"
 }
 
 // IsTimeInWindows checks if the given time is within any of the defined disruption windows.
@@ -107,8 +111,8 @@ func windowInfo(nowUTC time.Time, w workloadsv1alpha1.DisruptionWindow) (start, 
 		location = w.TimeZone
 	}
 
-	if strings.EqualFold(location, "Local") {
-		err = errors.Join(err, fmt.Errorf("invalid timeZone %q: Local is not allowed", w.TimeZone))
+	if isLocalTimeZone(location) {
+		err = errors.Join(err, fmt.Errorf("`timeZone` must not be %s, got '%s'", QuotedList([]string{"Local", "local"}), w.TimeZone))
 	}
 
 	var timeZoneErr error
