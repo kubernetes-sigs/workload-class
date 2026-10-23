@@ -31,12 +31,12 @@ type DisruptionPolicy struct {
 	// +optional
 	AllowedDisruptionWindows []DisruptionWindow `json:"allowedDisruptionWindows,omitempty"`
 
-	// AllowedDisruptionsOutsideOfWindow specifies subjects that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
-	// +listType=map
-	// +listMapKey=kind
-	// +listMapKey=name
+	// AllowedDisruptionsOutsideOfWindow lists portable disruption causes that can disrupt
+	// even outside of windows (e.g. VPA, ClusterAutoscaler, DriverUpdate, SecurityPatch).
+	// Causes are mapped to cluster-internal identities by a WorkloadClassGuardrail.
+	// +listType=set
 	// +optional
-	AllowedDisruptionsOutsideOfWindow []Subject `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
+	AllowedDisruptionsOutsideOfWindow []DisruptionCause `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
 
 	// MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
 	// If exceeded, maintenance takes precedence over per-pod run-duration hints.
@@ -92,27 +92,10 @@ type DisruptionWindow struct {
 	EndTime string `json:"endTime,omitempty"`
 }
 
-// Subject defines the identity of a user, group, or service account.
-// It is used to specify who or what is granted permissions or is the target
-// of a policy. The structure aligns with standard Kubernetes RBAC subjects.
-type Subject struct {
-	// Kind can be User, Group, or ServiceAccount
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=User;Group;ServiceAccount
-	Kind string `json:"kind"`
-
-	// Name of the identity
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=253
-	Name string `json:"name"`
-
-	// Namespace of the ServiceAccount (only for ServiceAccount kind)
-	// +optional
-	// +kubebuilder:validation:MaxLength=63
-	// +kubebuilder:validation:Pattern="^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-	Namespace string `json:"namespace,omitempty"`
-}
+// DisruptionCause is a portable, cluster-independent label for the source of a
+// disruption (e.g. "VPA", "ClusterAutoscaler", "DriverUpdate", "SecurityPatch"),
+// mapped to cluster-internal identities via WorkloadClassGuardrail.
+type DisruptionCause string
 
 // WorkloadClassSpec defines the desired state of WorkloadClass
 type WorkloadClassSpec struct {

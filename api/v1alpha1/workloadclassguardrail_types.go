@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -52,6 +53,24 @@ type Disruption struct {
 	// EmergencyOverride allows bypassing all constraints immediately.
 	// +optional
 	EmergencyOverride bool `json:"emergencyOverride,omitempty"`
+
+	// CauseIdentities maps portable disruption causes declared in WorkloadClass
+	// (allowedDisruptionsOutsideOfWindow) to the cluster-internal identities that represent
+	// them in this cluster.
+	// +listType=map
+	// +listMapKey=cause
+	// +optional
+	CauseIdentities []CauseIdentityMapping `json:"causeIdentities,omitempty"`
+}
+
+// CauseIdentityMapping binds a disruption cause to the subjects that perform it in this cluster.
+type CauseIdentityMapping struct {
+	// Cause is the portable disruption cause being mapped.
+	Cause DisruptionCause `json:"cause"`
+
+	// Subjects are the cluster-internal identities whose evictions are attributed to this cause.
+	// +listType=atomic
+	Subjects []rbacv1.Subject `json:"subjects"`
 }
 
 // WorkloadClassGuardrailSpec defines the desired state of WorkloadClassGuardrail

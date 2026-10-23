@@ -10,3 +10,14 @@ spec:
         - Sunday
       maxAllowedWindows: 2
       maxNonDisruptionDurationDays: 30
+      causeIdentities:
+        - cause: VPA
+          subjects:
+            - kind: ServiceAccount
+              name: vpa-updater
+              namespace: kube-system
+        - cause: ClusterAutoscaler
+          subjects:
+            - kind: ServiceAccount
+              name: cluster-autoscaler
+              namespace: kube-system

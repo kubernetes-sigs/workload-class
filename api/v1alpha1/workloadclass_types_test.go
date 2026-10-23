@@ -79,12 +79,9 @@ func TestWorkloadClassDeepCopy(t *testing.T) {
 						EndTime:    "04:00",
 					},
 				},
-				AllowedDisruptionsOutsideOfWindow: []Subject{
-					{
-						Kind:      "ServiceAccount",
-						Name:      "vpa-updater",
-						Namespace: "kube-system",
-					},
+				AllowedDisruptionsOutsideOfWindow: []DisruptionCause{
+					"VPA",
+					"ClusterAutoscaler",
 				},
 				MaxNonDisruptionDurationDays:    1,
 				MinInitialRunDurationDays:       2,
@@ -115,8 +112,8 @@ func TestWorkloadClassDeepCopy(t *testing.T) {
 		t.Error("modifying copied DaysOfWeek mutated original")
 	}
 
-	copied.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow[0].Name = "changed"
-	if orig.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow[0].Name != "vpa-updater" {
+	copied.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow[0] = "changed"
+	if orig.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow[0] != "VPA" {
 		t.Error("modifying copied AllowedDisruptionsOutsideOfWindow mutated original")
 	}
 

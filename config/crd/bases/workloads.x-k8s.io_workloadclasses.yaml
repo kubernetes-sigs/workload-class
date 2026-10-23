@@ -91,41 +91,18 @@ spec:
                     - name
                     x-kubernetes-list-type: map
                   allowedDisruptionsOutsideOfWindow:
-                    description: AllowedDisruptionsOutsideOfWindow specifies subjects
-                      that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
+                    description: |-
+                      AllowedDisruptionsOutsideOfWindow lists portable disruption causes that can disrupt
+                      even outside of windows (e.g. VPA, ClusterAutoscaler, DriverUpdate, SecurityPatch).
+                      Causes are mapped to cluster-internal identities by a WorkloadClassGuardrail.
                     items:
                       description: |-
-                        Subject defines the identity of a user, group, or service account.
-                        It is used to specify who or what is granted permissions or is the target
-                        of a policy. The structure aligns with standard Kubernetes RBAC subjects.
-                      properties:
-                        kind:
-                          description: Kind can be User, Group, or ServiceAccount
-                          enum:
-                          - User
-                          - Group
-                          - ServiceAccount
-                          type: string
-                        name:
-                          description: Name of the identity
-                          maxLength: 253
-                          minLength: 1
-                          type: string
-                        namespace:
-                          description: Namespace of the ServiceAccount (only for ServiceAccount
-                            kind)
-                          maxLength: 63
-                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                          type: string
-                      required:
-                      - kind
-                      - name
-                      type: object
+                        DisruptionCause is a portable, cluster-independent label for the source of a
+                        disruption (e.g. "VPA", "ClusterAutoscaler", "DriverUpdate", "SecurityPatch"),
+                        mapped to cluster-internal identities via WorkloadClassGuardrail.
+                      type: string
                     type: array
-                    x-kubernetes-list-map-keys:
-                    - kind
-                    - name
-                    x-kubernetes-list-type: map
+                    x-kubernetes-list-type: set
                   emergencyOverride:
                     description: EmergencyOverride allows bypassing all constraints
                       immediately.
