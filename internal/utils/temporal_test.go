@@ -61,6 +61,18 @@ func TestWeekdaysValid(t *testing.T) {
 	}
 }
 
+func TestWeekdaysValidMessage(t *testing.T) {
+	err := WeekdaysValid([]string{"Monday", "Funday", "monday"})
+	if err == nil {
+		t.Fatal("WeekdaysValid() error = nil, want an error")
+	}
+	want := "`daysOfWeek` must only contain 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', " +
+		"got 'Funday', 'monday'"
+	if err.Error() != want {
+		t.Errorf("WeekdaysValid() error = %q, want %q", err.Error(), want)
+	}
+}
+
 func TestTimeZoneValid(t *testing.T) {
 	tests := []struct {
 		name     string
