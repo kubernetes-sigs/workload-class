@@ -126,12 +126,12 @@ func allowedWindowsViolation(maxAllowedWindows, wlcWindows int) string {
 //
 // A guardrail value of 0 means the guardrail does not set a limit. A WorkloadClass value of 0 (or less) means
 // the WorkloadClass has no limit, which exceeds any guardrail limit.
-func disruptionDurationDaysViolation(maxNonDisruptionDurationDays, guardrailMaxDays int32) (violation string) {
+func disruptionDurationDaysViolation(wlcMaxDays, guardrailMaxDays int32) string {
 	if guardrailMaxDays > 0 &&
-		(maxNonDisruptionDurationDays <= 0 || maxNonDisruptionDurationDays > guardrailMaxDays) {
+		(wlcMaxDays <= 0 || wlcMaxDays > guardrailMaxDays) {
 		return fmt.Sprintf(
 			"`maxNonDisruptionDurationDays` must be between 1 and %d, inclusive (guardrail limit), got %d (0 means no limit)",
-			guardrailMaxDays, maxNonDisruptionDurationDays)
+			guardrailMaxDays, wlcMaxDays)
 	}
 	return ""
 }

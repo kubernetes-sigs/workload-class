@@ -343,6 +343,11 @@ func TestOverlappingWorkloadClasses(t *testing.T) {
 		{Key: "app", Operator: metav1.LabelSelectorOpIn},
 	}
 
+	now := metav1.Now()
+	deleting := testWorkloadClass("wc-deleting", ns, nginx)
+	deleting.Finalizers = []string{"workloads.x-k8s.io/test"}
+	deleting.DeletionTimestamp = &now
+
 	testCases := []struct {
 		name      string
 		existing  []client.Object
@@ -373,6 +378,10 @@ func TestOverlappingWorkloadClasses(t *testing.T) {
 		{
 			name:     "other_invalid_selector_is_skipped",
 			existing: []client.Object{wcCurrent, invalid},
+		},
+		{
+			name:     "other_deleting_is_skipped",
+			existing: []client.Object{wcCurrent, deleting},
 		},
 		{
 			name: "multiple_overlapping",
@@ -421,7 +430,7 @@ func testGuardrail(name string, disruption workloadsv1alpha1.Disruption) workloa
 func TestValidateAgainstGuardrails(t *testing.T) {
 	wc := &workloadsv1alpha1.WorkloadClass{
 		Spec: workloadsv1alpha1.WorkloadClassSpec{
-			DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{MaxNonDisruptionDurationDays: 10},
+			DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{MaxNonDisruptionDurationDays: 40},
 		},
 	}
 
@@ -436,23 +445,25 @@ func TestValidateAgainstGuardrails(t *testing.T) {
 		{
 			name: "compliant_with_all_guardrails",
 			guardrails: []workloadsv1alpha1.WorkloadClassGuardrail{
-				testGuardrail("a", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 10}),
-				testGuardrail("b", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 30}),
+				testGuardrail("a", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 40}),
+				testGuardrail("b", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 60}),
 			},
 		},
 		{
-			name: "violations_from_every_guardrail_without_guardrail_names",
+			name: "effective_strictest_limits_across_guardrails_without_guardrail_names",
 			guardrails: []workloadsv1alpha1.WorkloadClassGuardrail{
-				testGuardrail("lax", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 30}),
-				testGuardrail("strict", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 5}),
-				testGuardrail("weekend", workloadsv1alpha1.Disruption{
-					DaysOfWeek:                   []string{"Saturday", "Sunday"},
+				testGuardrail("lax", workloadsv1alpha1.Disruption{
+					DaysOfWeek:                   []string{"Friday", "Saturday", "Sunday"},
 					MaxNonDisruptionDurationDays: 30,
+				}),
+				testGuardrail("strict", workloadsv1alpha1.Disruption{
+					DaysOfWeek:                   []string{"Saturday", "Sunday", "Monday"},
+					MaxNonDisruptionDurationDays: 5,
 				}),
 			},
 			want: []string{
-				"`maxNonDisruptionDurationDays` must be between 1 and 5, inclusive",
 				"`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only 'Saturday', 'Sunday'",
+				"`maxNonDisruptionDurationDays` must be between 1 and 5, inclusive",
 			},
 		},
 		{
@@ -463,6 +474,23 @@ func TestValidateAgainstGuardrails(t *testing.T) {
 			},
 			want: []string{
 				"`maxNonDisruptionDurationDays` must be between 1 and 5, inclusive",
+			},
+		},
+		{
+			name: "disjoint_days_of_week_constraints_are_both_reported",
+			guardrails: []workloadsv1alpha1.WorkloadClassGuardrail{
+				testGuardrail("saturday", workloadsv1alpha1.Disruption{
+					DaysOfWeek:                   []string{"Saturday"},
+					MaxNonDisruptionDurationDays: 60,
+				}),
+				testGuardrail("sunday", workloadsv1alpha1.Disruption{
+					DaysOfWeek:                   []string{"Sunday"},
+					MaxNonDisruptionDurationDays: 60,
+				}),
+			},
+			want: []string{
+				"`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only 'Saturday'",
+				"`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only 'Sunday'",
 			},
 		},
 	}
@@ -607,4 +635,31 @@ func TestWorkloadClassMapFuncs(t *testing.T) {
 			t.Errorf("workloadClassesInNamespace() = %v, want %v", got, want)
 		}
 	})
+}
+
+func TestSelectorOverlapMessageCapsItems(t *testing.T) {
+	var overlapping []workloadsv1alpha1.WorkloadClass
+	for i := 1; i <= 7; i++ {
+		overlapping = append(overlapping, *testWorkloadClass(fmt.Sprintf("wc-%d", i), "ns", nil))
+	}
+
+	got := selectorOverlapMessage(overlapping)
+	want := "`podSelector` must not select the same Pods as another WorkloadClass in the namespace, " +
+		"but it overlaps with the `podSelector` of 'wc-1', 'wc-2', 'wc-3', 'wc-4', 'wc-5', and 2 more"
+	if got != want {
+		t.Errorf("selectorOverlapMessage() = %q, want %q", got, want)
+	}
+}
+
+func TestTruncateMessage(t *testing.T) {
+	if got := truncateMessage("short", 10); got != "short" {
+		t.Errorf("truncateMessage(\"short\", 10) = %q, want \"short\"", got)
+	}
+	if got := truncateMessage("0123456789abcdef", 10); got != "0123456..." {
+		t.Errorf("truncateMessage(\"0123456789abcdef\", 10) = %q, want \"0123456...\"", got)
+	}
+	// Multi-byte UTF-8 rune ("é" is 2 bytes at indices 6..7) must not be split mid-rune.
+	if got := truncateMessage("123456é890", 10); got != "123456..." {
+		t.Errorf("truncateMessage(\"123456é890\", 10) = %q, want \"123456...\"", got)
+	}
 }
