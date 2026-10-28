@@ -19,7 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,8 +40,10 @@ import (
 )
 
 const (
-	validationPassedMsg = "WorkloadClass adheres to all Guardrail constraints"
-	noGuardrailsMsg     = "No Guardrails found to validate against"
+	validationPassedMsg    = "WorkloadClass adheres to all Guardrail constraints"
+	noGuardrailsMsg        = "No Guardrails found to validate against"
+	maxConditionMessageLen = 32768
+	maxReportedOverlaps    = 5
 )
 
 // WorkloadClassReconciler reconciles a WorkloadClass object
@@ -48,9 +52,8 @@ type WorkloadClassReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses/finalizers,verbs=update
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclassguardrails,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -95,7 +98,9 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 //
 // Guardrail and spec violations take precedence and are reported with ReasonValidationFailed.
 // If the only problem is that the PodSelector overlaps with other WorkloadClasses in the namespace,
-// ReasonSelectorOverlap is used instead.
+// ReasonSelectorOverlap is used instead. Overlap is intentionally reported symmetrically on every
+// WorkloadClass involved so that any affected workload owner sees the conflict, while keeping a
+// distinct Reason from ReasonValidationFailed.
 func validatedCondition(
 	wc *workloadsv1alpha1.WorkloadClass,
 	guardrails []workloadsv1alpha1.WorkloadClassGuardrail,
@@ -120,11 +125,11 @@ func validatedCondition(
 		}
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = workloadsv1alpha1.ReasonValidationFailed
-		cond.Message = strings.Join(violations, "; ")
+		cond.Message = truncateMessage(strings.Join(violations, "; "), maxConditionMessageLen)
 	case overlapMsg != "":
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = workloadsv1alpha1.ReasonSelectorOverlap
-		cond.Message = overlapMsg
+		cond.Message = truncateMessage(overlapMsg, maxConditionMessageLen)
 	case len(guardrails) == 0:
 		cond.Reason = workloadsv1alpha1.ReasonNoGuardrails
 		cond.Message = noGuardrailsMsg
@@ -133,8 +138,27 @@ func validatedCondition(
 	return cond
 }
 
-// validateSpec validates the fields of the WorkloadClass spec that cannot be fully expressed
-// through CRD schema validation.
+// truncateMessage caps msg at maxLen bytes on a UTF-8 rune boundary so that it fits within the CRD
+// schema limit for metav1.Condition.Message.
+func truncateMessage(msg string, maxLen int) string {
+	const ellipsis = "..."
+	if len(msg) <= maxLen {
+		return msg
+	}
+	if maxLen <= len(ellipsis) {
+		return ellipsis[:maxLen]
+	}
+	cut := maxLen - len(ellipsis)
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + ellipsis
+}
+
+// validateSpec validates the fields of the WorkloadClass spec that are not fully enforced by the
+// CRD OpenAPI/CEL schema (semantic LabelSelector validation, valid weekday names, and IANA time zone
+// database lookup), and acts as defense-in-depth for rules also checked at admission time (such as
+// rejecting the 'Local' time zone).
 func validateSpec(wc *workloadsv1alpha1.WorkloadClass) []string {
 	var violations []string
 	if wc.Spec.PodSelector != nil {
@@ -158,27 +182,97 @@ func validateSpec(wc *workloadsv1alpha1.WorkloadClass) []string {
 // validateAgainstGuardrails returns the guardrail constraints that the WorkloadClass violates.
 //
 // Guardrail names are deliberately omitted: guardrails are cluster-scoped, and users who can read the
-// WorkloadClass status may not have access to them. Only the limits needed to fix the WorkloadClass are
-// reported, and identical violations from several guardrails are reported once.
+// WorkloadClass status may not have access to them. Constraint limits across all guardrails are combined
+// into the effective (strictest) limit—minimum MaxAllowedWindows, minimum MaxNonDisruptionDurationDays,
+// and the intersection of restricting DaysOfWeek—so workload owners see a single actionable limit per field.
 func validateAgainstGuardrails(wc *workloadsv1alpha1.WorkloadClass, guardrails []workloadsv1alpha1.WorkloadClassGuardrail) []string {
-	violations := make([]string, 0, len(guardrails))
-	seen := sets.New[string]()
+	if len(guardrails) == 0 {
+		return nil
+	}
+
+	var (
+		effectiveDays  []string
+		daysRestricted bool
+		minWindows     int32
+		minDuration    int32
+	)
 	for i := range guardrails {
-		for _, v := range utils.GuardrailViolations(wc, &guardrails[i]) {
-			if !seen.Has(v) {
-				seen.Insert(v)
-				violations = append(violations, v)
+		d := guardrails[i].Spec.Constraints.Disruption
+		if len(d.DaysOfWeek) > 0 {
+			if !daysRestricted {
+				daysRestricted = true
+				seen := sets.New[string]()
+				for _, day := range d.DaysOfWeek {
+					if !seen.Has(day) {
+						seen.Insert(day)
+						effectiveDays = append(effectiveDays, day)
+					}
+				}
+			} else {
+				allowed := sets.New(d.DaysOfWeek...)
+				effectiveDays = slices.DeleteFunc(effectiveDays, func(day string) bool {
+					return !allowed.Has(day)
+				})
+			}
+		}
+		if d.MaxAllowedWindows > 0 && (minWindows == 0 || d.MaxAllowedWindows < minWindows) {
+			minWindows = d.MaxAllowedWindows
+		}
+		if d.MaxNonDisruptionDurationDays > 0 && (minDuration == 0 || d.MaxNonDisruptionDurationDays < minDuration) {
+			minDuration = d.MaxNonDisruptionDurationDays
+		}
+	}
+
+	var violations []string
+	if daysRestricted && len(effectiveDays) == 0 {
+		// Guardrails have disjoint DaysOfWeek sets with no common allowed day; report each distinct
+		// DaysOfWeek constraint so the conflict is visible.
+		seen := sets.New[string]()
+		for i := range guardrails {
+			days := guardrails[i].Spec.Constraints.Disruption.DaysOfWeek
+			if len(days) == 0 {
+				continue
+			}
+			onlyDays := workloadsv1alpha1.WorkloadClassGuardrail{
+				Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1alpha1.Constraints{
+						Disruption: workloadsv1alpha1.Disruption{DaysOfWeek: days},
+					},
+				},
+			}
+			for _, v := range utils.GuardrailViolations(wc, &onlyDays) {
+				if !seen.Has(v) {
+					seen.Insert(v)
+					violations = append(violations, v)
+				}
 			}
 		}
 	}
+
+	effective := workloadsv1alpha1.WorkloadClassGuardrail{
+		Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{
+			Constraints: workloadsv1alpha1.Constraints{
+				Disruption: workloadsv1alpha1.Disruption{
+					DaysOfWeek:                   effectiveDays,
+					MaxAllowedWindows:            minWindows,
+					MaxNonDisruptionDurationDays: minDuration,
+				},
+			},
+		},
+	}
+	violations = append(violations, utils.GuardrailViolations(wc, &effective)...)
 	return violations
 }
 
-// overlappingWorkloadClasses returns the other WorkloadClasses in the same namespace whose PodSelector
-// could select the same Pod as the WorkloadClass PodSelector.
+// overlappingWorkloadClasses returns the other active WorkloadClasses in the same namespace whose
+// PodSelector could select the same Pod as the WorkloadClass PodSelector.
 //
-// WorkloadClasses with an invalid PodSelector are skipped; the invalid PodSelector is reported on the
-// WorkloadClass that owns it.
+// Overlap is symmetric: every WorkloadClass whose selector overlaps with another active WorkloadClass in
+// the namespace is reported with ReasonSelectorOverlap. WorkloadClasses that are being deleted or have an
+// invalid PodSelector are skipped; an invalid PodSelector is reported on the WorkloadClass that owns it.
+//
+// TODO: Skip selector overlap checks when the Namespace has the workloads.x-k8s.io/enforced-class
+// (EnforcedWorkloadClassLabel) label set to an active WorkloadClass, once the controller watches Namespaces.
 func (r *WorkloadClassReconciler) overlappingWorkloadClasses(
 	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass,
 ) ([]workloadsv1alpha1.WorkloadClass, error) {
@@ -189,7 +283,7 @@ func (r *WorkloadClassReconciler) overlappingWorkloadClasses(
 
 	var matches []workloadsv1alpha1.WorkloadClass
 	for _, other := range workloadClasses.Items {
-		if other.Name == wc.Name {
+		if other.Name == wc.Name || !other.DeletionTimestamp.IsZero() {
 			continue
 		}
 		overlap, err := utils.SelectorsOverlap(wc.Spec.PodSelector, other.Spec.PodSelector)
@@ -205,27 +299,35 @@ func (r *WorkloadClassReconciler) overlappingWorkloadClasses(
 
 // selectorOverlapMessage returns a message listing the WorkloadClasses whose PodSelector overlaps
 // with the PodSelector of the reconciled WorkloadClass, or an empty string if there are none.
+// At most maxReportedOverlaps names are listed explicitly, followed by "and K more" if additional
+// classes overlap.
 func selectorOverlapMessage(overlapping []workloadsv1alpha1.WorkloadClass) string {
 	if len(overlapping) == 0 {
 		return ""
 	}
 
-	names := make([]string, 0, len(overlapping))
-	for _, o := range overlapping {
+	limit := min(len(overlapping), maxReportedOverlaps)
+	names := make([]string, 0, limit)
+	for _, o := range overlapping[:limit] {
 		names = append(names, o.Name)
 	}
+	listed := utils.QuotedList(names)
+	if extra := len(overlapping) - limit; extra > 0 {
+		listed = fmt.Sprintf("%s, and %d more", listed, extra)
+	}
 	return fmt.Sprintf("`podSelector` must not select the same Pods as another WorkloadClass in the namespace, "+
-		"but it overlaps with the `podSelector` of %s", utils.QuotedList(names))
+		"but it overlaps with the `podSelector` of %s", listed)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&workloadsv1alpha1.WorkloadClass{}).
-		// Re-validate all WorkloadClasses when a guardrail changes.
+		// Re-validate all WorkloadClasses when a guardrail spec changes, is created, or is deleted.
 		Watches(
 			&workloadsv1alpha1.WorkloadClassGuardrail{},
 			handler.EnqueueRequestsFromMapFunc(r.allWorkloadClasses),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		// Re-validate the other WorkloadClasses in a namespace when a WorkloadClass is created, deleted, or its spec
 		// changes, so that their SelectorOverlap status stays current.
