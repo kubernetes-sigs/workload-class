@@ -42,6 +42,7 @@ import (
 const (
 	validationPassedMsg    = "WorkloadClass adheres to all Guardrail constraints"
 	noGuardrailsMsg        = "No Guardrails found to validate against"
+	disjointDaysOfWeekMsg  = "cluster guardrails restrict `daysOfWeek` to disjoint sets, so no disruption window can comply; contact your cluster administrator"
 	maxConditionMessageLen = 32768
 	maxReportedOverlaps    = 5
 )
@@ -191,7 +192,7 @@ func validateAgainstGuardrails(wc *workloadsv1alpha1.WorkloadClass, guardrails [
 	}
 
 	var (
-		effectiveDays  []string
+		effectiveDays  = utils.AllWeekdays()
 		daysRestricted bool
 		minWindows     int32
 		minDuration    int32
@@ -199,21 +200,11 @@ func validateAgainstGuardrails(wc *workloadsv1alpha1.WorkloadClass, guardrails [
 	for i := range guardrails {
 		d := guardrails[i].Spec.Constraints.Disruption
 		if len(d.DaysOfWeek) > 0 {
-			if !daysRestricted {
-				daysRestricted = true
-				seen := sets.New[string]()
-				for _, day := range d.DaysOfWeek {
-					if !seen.Has(day) {
-						seen.Insert(day)
-						effectiveDays = append(effectiveDays, day)
-					}
-				}
-			} else {
-				allowed := sets.New(d.DaysOfWeek...)
-				effectiveDays = slices.DeleteFunc(effectiveDays, func(day string) bool {
-					return !allowed.Has(day)
-				})
-			}
+			daysRestricted = true
+			allowed := sets.New(d.DaysOfWeek...)
+			effectiveDays = slices.DeleteFunc(effectiveDays, func(day string) bool {
+				return !allowed.Has(day)
+			})
 		}
 		if d.MaxAllowedWindows > 0 && (minWindows == 0 || d.MaxAllowedWindows < minWindows) {
 			minWindows = d.MaxAllowedWindows
@@ -222,31 +213,13 @@ func validateAgainstGuardrails(wc *workloadsv1alpha1.WorkloadClass, guardrails [
 			minDuration = d.MaxNonDisruptionDurationDays
 		}
 	}
+	if !daysRestricted {
+		effectiveDays = nil
+	}
 
 	var violations []string
 	if daysRestricted && len(effectiveDays) == 0 {
-		// Guardrails have disjoint DaysOfWeek sets with no common allowed day; report each distinct
-		// DaysOfWeek constraint so the conflict is visible.
-		seen := sets.New[string]()
-		for i := range guardrails {
-			days := guardrails[i].Spec.Constraints.Disruption.DaysOfWeek
-			if len(days) == 0 {
-				continue
-			}
-			onlyDays := workloadsv1alpha1.WorkloadClassGuardrail{
-				Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{
-					Constraints: workloadsv1alpha1.Constraints{
-						Disruption: workloadsv1alpha1.Disruption{DaysOfWeek: days},
-					},
-				},
-			}
-			for _, v := range utils.GuardrailViolations(wc, &onlyDays) {
-				if !seen.Has(v) {
-					seen.Insert(v)
-					violations = append(violations, v)
-				}
-			}
-		}
+		violations = append(violations, disjointDaysOfWeekMsg)
 	}
 
 	effective := workloadsv1alpha1.WorkloadClassGuardrail{
@@ -265,7 +238,7 @@ func validateAgainstGuardrails(wc *workloadsv1alpha1.WorkloadClass, guardrails [
 }
 
 // overlappingWorkloadClasses returns the other active WorkloadClasses in the same namespace whose
-// PodSelector could select the same Pod as the WorkloadClass PodSelector.
+// PodSelector could select the same Pod as the WorkloadClass PodSelector, sorted by name.
 //
 // Overlap is symmetric: every WorkloadClass whose selector overlaps with another active WorkloadClass in
 // the namespace is reported with ReasonSelectorOverlap. WorkloadClasses that are being deleted or have an
@@ -294,25 +267,30 @@ func (r *WorkloadClassReconciler) overlappingWorkloadClasses(
 			matches = append(matches, other)
 		}
 	}
+	slices.SortFunc(matches, func(a, b workloadsv1alpha1.WorkloadClass) int {
+		return strings.Compare(a.Name, b.Name)
+	})
 	return matches, nil
 }
 
 // selectorOverlapMessage returns a message listing the WorkloadClasses whose PodSelector overlaps
 // with the PodSelector of the reconciled WorkloadClass, or an empty string if there are none.
-// At most maxReportedOverlaps names are listed explicitly, followed by "and K more" if additional
-// classes overlap.
+// Names are sorted so the message does not depend on informer cache iteration order, and at most
+// maxReportedOverlaps names are listed explicitly, followed by "and K more" if additional classes overlap.
 func selectorOverlapMessage(overlapping []workloadsv1alpha1.WorkloadClass) string {
 	if len(overlapping) == 0 {
 		return ""
 	}
 
-	limit := min(len(overlapping), maxReportedOverlaps)
-	names := make([]string, 0, limit)
-	for _, o := range overlapping[:limit] {
+	names := make([]string, 0, len(overlapping))
+	for _, o := range overlapping {
 		names = append(names, o.Name)
 	}
-	listed := utils.QuotedList(names)
-	if extra := len(overlapping) - limit; extra > 0 {
+	slices.Sort(names)
+
+	limit := min(len(names), maxReportedOverlaps)
+	listed := utils.QuotedList(names[:limit])
+	if extra := len(names) - limit; extra > 0 {
 		listed = fmt.Sprintf("%s, and %d more", listed, extra)
 	}
 	return fmt.Sprintf("`podSelector` must not select the same Pods as another WorkloadClass in the namespace, "+
@@ -322,7 +300,10 @@ func selectorOverlapMessage(overlapping []workloadsv1alpha1.WorkloadClass) strin
 // SetupWithManager sets up the controller with the Manager.
 func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&workloadsv1alpha1.WorkloadClass{}).
+		For(
+			&workloadsv1alpha1.WorkloadClass{},
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
 		// Re-validate all WorkloadClasses when a guardrail spec changes, is created, or is deleted.
 		Watches(
 			&workloadsv1alpha1.WorkloadClassGuardrail{},
