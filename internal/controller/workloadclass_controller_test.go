@@ -31,8 +31,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/config"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1alpha1 "sigs.k8s.io/workload-class/api/v1alpha1"
@@ -299,6 +303,20 @@ var _ = Describe("WorkloadClass Controller", func() {
 			cond = reconcileAndGetValidated(workloadClassName)
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonNoGuardrails))
+
+			By("clearing SelectorOverlap when the overlapping WorkloadClass is deleted")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: otherName, Namespace: namespace}, other)).To(Succeed())
+			other.Spec.PodSelector = podSelector.DeepCopy()
+			Expect(k8sClient.Update(ctx, other)).To(Succeed())
+
+			cond = reconcileAndGetValidated(workloadClassName)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonSelectorOverlap))
+
+			Expect(k8sClient.Delete(ctx, other)).To(Succeed())
+			cond = reconcileAndGetValidated(workloadClassName)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonNoGuardrails))
 		})
 
 		It("should report guardrail violations and selector overlap together as ValidationFailed", func() {
@@ -313,6 +331,145 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonValidationFailed))
 			Expect(cond.Message).To(ContainSubstring("`maxNonDisruptionDurationDays` must be between 1 and 3, inclusive (guardrail limit), got 5"))
 			Expect(cond.Message).To(ContainSubstring("overlaps with the `podSelector` of 'test-workloadclass-same-selector'"))
+		})
+	})
+
+	Context("When running with the controller manager", func() {
+		const (
+			namespace     = "default"
+			guardrailName = "test-mgr-guardrail"
+		)
+
+		var (
+			mgrCtx    context.Context
+			mgrCancel context.CancelFunc
+			mgrDone   chan error
+		)
+
+		BeforeEach(func() {
+			mgrCtx, mgrCancel = context.WithCancel(context.Background())
+			mgrDone = make(chan error, 1)
+
+			mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+				Scheme:  k8sClient.Scheme(),
+				Metrics: metricsserver.Options{BindAddress: "0"},
+				Controller: config.Controller{
+					SkipNameValidation: ptr.To(true),
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			reconciler := &WorkloadClassReconciler{
+				Client: mgr.GetClient(),
+				Scheme: mgr.GetScheme(),
+			}
+			Expect(reconciler.SetupWithManager(mgr)).To(Succeed())
+
+			go func() {
+				mgrDone <- mgr.Start(mgrCtx)
+			}()
+		})
+
+		AfterEach(func() {
+			mgrCancel()
+			Eventually(mgrDone).Should(Receive(BeNil()))
+
+			Expect(k8sClient.DeleteAllOf(ctx, &workloadsv1alpha1.WorkloadClass{}, client.InNamespace(namespace))).To(Succeed())
+			g := &workloadsv1alpha1.WorkloadClassGuardrail{ObjectMeta: metav1.ObjectMeta{Name: guardrailName}}
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, g))).To(Succeed())
+		})
+
+		eventuallyCondition := func(name string, status metav1.ConditionStatus, reason string) {
+			key := types.NamespacedName{Name: name, Namespace: namespace}
+			Eventually(func(g Gomega) {
+				wc := &workloadsv1alpha1.WorkloadClass{}
+				g.Expect(k8sClient.Get(ctx, key, wc)).To(Succeed())
+				cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.ObservedGeneration).To(Equal(wc.Generation))
+				g.Expect(cond.Status).To(Equal(status))
+				g.Expect(cond.Reason).To(Equal(reason))
+			}).Should(Succeed())
+		}
+
+		It("should not re-queue WorkloadClasses on a guardrail status-only update, and should re-queue on a spec update", func() {
+			guardrail := &workloadsv1alpha1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: guardrailName},
+				Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{
+					Constraints: workloadsv1alpha1.Constraints{
+						Disruption: workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 10},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, guardrail)).To(Succeed())
+
+			wcName := "wc-watched-by-guardrail"
+			wc := &workloadsv1alpha1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: wcName, Namespace: namespace},
+				Spec: workloadsv1alpha1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "watched"}},
+					DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{
+						MaxNonDisruptionDurationDays: 7,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wc)).To(Succeed())
+			eventuallyCondition(wcName, metav1.ConditionTrue, workloadsv1alpha1.ReasonValidationPassed)
+
+			By("clearing the WorkloadClass status condition without bumping its generation")
+			key := types.NamespacedName{Name: wcName, Namespace: namespace}
+			Expect(k8sClient.Get(ctx, key, wc)).To(Succeed())
+			wc.Status.Conditions = nil
+			Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+
+			By("updating only the guardrail status and verifying the WorkloadClass is not re-queued")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: guardrailName}, guardrail)).To(Succeed())
+			meta.SetStatusCondition(&guardrail.Status.Conditions, metav1.Condition{
+				Type:               workloadsv1alpha1.ConditionTypeValidated,
+				Status:             metav1.ConditionTrue,
+				Reason:             workloadsv1alpha1.ReasonValidationPassed,
+				Message:            "Guardrail is valid",
+				ObservedGeneration: guardrail.Generation,
+			})
+			Expect(k8sClient.Status().Update(ctx, guardrail)).To(Succeed())
+
+			Consistently(func(g Gomega) {
+				current := &workloadsv1alpha1.WorkloadClass{}
+				g.Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+				g.Expect(current.Status.Conditions).To(BeEmpty())
+			}, "300ms", "50ms").Should(Succeed())
+
+			By("updating the guardrail spec and verifying the WorkloadClass is re-queued and re-validated")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: guardrailName}, guardrail)).To(Succeed())
+			guardrail.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays = 5
+			Expect(k8sClient.Update(ctx, guardrail)).To(Succeed())
+
+			eventuallyCondition(wcName, metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
+		})
+
+		It("should clear SelectorOverlap on the remaining WorkloadClass when the overlapping WorkloadClass is deleted", func() {
+			for _, name := range []string{"wc-overlap-a", "wc-overlap-b"} {
+				wc := &workloadsv1alpha1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+					Spec: workloadsv1alpha1.WorkloadClassSpec{
+						PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "shared"}},
+						DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{
+							MaxNonDisruptionDurationDays: 7,
+						},
+					},
+				}
+				Expect(k8sClient.Create(ctx, wc)).To(Succeed())
+			}
+
+			eventuallyCondition("wc-overlap-a", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
+			eventuallyCondition("wc-overlap-b", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
+
+			By("deleting wc-overlap-b and verifying the sibling watch clears SelectorOverlap on wc-overlap-a")
+			Expect(k8sClient.Delete(ctx, &workloadsv1alpha1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "wc-overlap-b", Namespace: namespace},
+			})).To(Succeed())
+
+			eventuallyCondition("wc-overlap-a", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
 		})
 	})
 })
@@ -384,13 +541,14 @@ func TestOverlappingWorkloadClasses(t *testing.T) {
 			existing: []client.Object{wcCurrent, deleting},
 		},
 		{
-			name: "multiple_overlapping",
+			name: "multiple_overlapping_sorted_by_name",
 			existing: []client.Object{
 				wcCurrent,
+				testWorkloadClass("wc-same-3", ns, nginx),
 				testWorkloadClass("wc-same-1", ns, nginx),
 				testWorkloadClass("wc-same-2", ns, nginx),
 			},
-			wantNames: []string{"wc-same-1", "wc-same-2"},
+			wantNames: []string{"wc-same-1", "wc-same-2", "wc-same-3"},
 		},
 	}
 	for _, tc := range testCases {
@@ -410,7 +568,6 @@ func TestOverlappingWorkloadClasses(t *testing.T) {
 			for _, wc := range got {
 				gotNames = append(gotNames, wc.Name)
 			}
-			slices.Sort(gotNames)
 			if !slices.Equal(gotNames, tc.wantNames) {
 				t.Errorf("overlappingWorkloadClasses() = %v, want %v", gotNames, tc.wantNames)
 			}
@@ -462,7 +619,24 @@ func TestValidateAgainstGuardrails(t *testing.T) {
 				}),
 			},
 			want: []string{
-				"`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only 'Saturday', 'Sunday'",
+				"`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only 'Sunday', 'Saturday'",
+				"`maxNonDisruptionDurationDays` must be between 1 and 5, inclusive",
+			},
+		},
+		{
+			name: "effective_days_order_is_deterministic_regardless_of_guardrail_order",
+			guardrails: []workloadsv1alpha1.WorkloadClassGuardrail{
+				testGuardrail("strict", workloadsv1alpha1.Disruption{
+					DaysOfWeek:                   []string{"Saturday", "Sunday", "Monday"},
+					MaxNonDisruptionDurationDays: 5,
+				}),
+				testGuardrail("lax", workloadsv1alpha1.Disruption{
+					DaysOfWeek:                   []string{"Friday", "Saturday", "Sunday"},
+					MaxNonDisruptionDurationDays: 30,
+				}),
+			},
+			want: []string{
+				"`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only 'Sunday', 'Saturday'",
 				"`maxNonDisruptionDurationDays` must be between 1 and 5, inclusive",
 			},
 		},
@@ -477,7 +651,7 @@ func TestValidateAgainstGuardrails(t *testing.T) {
 			},
 		},
 		{
-			name: "disjoint_days_of_week_constraints_are_both_reported",
+			name: "disjoint_days_of_week_constraints_report_actionable_conflict_message",
 			guardrails: []workloadsv1alpha1.WorkloadClassGuardrail{
 				testGuardrail("saturday", workloadsv1alpha1.Disruption{
 					DaysOfWeek:                   []string{"Saturday"},
@@ -489,8 +663,7 @@ func TestValidateAgainstGuardrails(t *testing.T) {
 				}),
 			},
 			want: []string{
-				"`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only 'Saturday'",
-				"`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only 'Sunday'",
+				disjointDaysOfWeekMsg,
 			},
 		},
 	}
@@ -638,8 +811,9 @@ func TestWorkloadClassMapFuncs(t *testing.T) {
 }
 
 func TestSelectorOverlapMessageCapsItems(t *testing.T) {
-	var overlapping []workloadsv1alpha1.WorkloadClass
-	for i := 1; i <= 7; i++ {
+	order := []int{7, 2, 5, 1, 6, 3, 4}
+	overlapping := make([]workloadsv1alpha1.WorkloadClass, 0, len(order))
+	for _, i := range order {
 		overlapping = append(overlapping, *testWorkloadClass(fmt.Sprintf("wc-%d", i), "ns", nil))
 	}
 
