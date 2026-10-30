@@ -132,24 +132,33 @@ spec:
                     type: boolean
                   graceTerminationDurationSeconds:
                     description: |-
-                      GraceTerminationDurationSeconds is the duration in seconds after a pod's deletionTimestamp is set during which
-                      the controller keeps the WorkloadClass MaintenanceReadiness as NotReady to allow in-flight pod terminations to drain
-                      before further disruptions occur. It does not override Pod.spec.terminationGracePeriodSeconds or set eviction DeleteOptions.gracePeriodSeconds.
+                      GraceTerminationDurationSeconds is the duration in seconds after a pod starts terminating during which the
+                      controller keeps the WorkloadClass MaintenanceReadiness as NotReady to allow in-flight pod terminations to drain
+                      before further disruptions occur. A pod starts terminating when its deletion is requested, which is its
+                      deletionTimestamp minus its deletionGracePeriodSeconds; the controller records the most recent such time in
+                      status.lastPodTerminationTime so that the duration is honored after the pod is gone. Pods that are deleted
+                      before the controller observes them terminating, such as pods deleted with a grace period of 0, are not counted.
+                      It does not override Pod.spec.terminationGracePeriodSeconds or set eviction DeleteOptions.gracePeriodSeconds.
                     format: int32
                     minimum: 0
                     type: integer
                   maxNonDisruptionDurationDays:
                     description: |-
-                      MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
-                      If exceeded, maintenance takes precedence over per-pod run-duration hints.
+                      MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted, counted from
+                      status.lastDisruptionTime, or from the creation of the WorkloadClass if no disruption has been observed yet.
+                      Once reached, the WorkloadClass is Overdue for maintenance: maintenance takes precedence over
+                      allowedDisruptionWindows and over per-pod run-duration hints.
                       When unset (0), no upper bound is placed on how long the workload can remain undisrupted.
                     format: int32
+                    maximum: 36500
                     minimum: 0
                     type: integer
                   minInitialRunDurationDays:
-                    description: MinInitialRunDurationDays is the minimum duration
-                      a pod must run before it can be disrupted.
+                    description: |-
+                      MinInitialRunDurationDays is the minimum duration a pod must run before it can be disrupted. It is counted from
+                      the pod's status.startTime, or from its creationTimestamp until the pod has been acknowledged by a kubelet.
                     format: int32
+                    maximum: 36500
                     minimum: 0
                     type: integer
                 type: object
@@ -272,6 +281,13 @@ spec:
               lastDisruptionTime:
                 description: LastDisruptionTime is the last time a disruption was
                   observed for pods in this class.
+                format: date-time
+                type: string
+              lastPodTerminationTime:
+                description: |-
+                  LastPodTerminationTime is the most recent time a pod selected by this class was observed to start terminating,
+                  that is, the time its deletion was requested. The controller keeps MaintenanceReadiness as NotReady until
+                  GraceTerminationDurationSeconds have passed since this time, even if the pod no longer exists.
                 format: date-time
                 type: string
               maintenanceReadiness:

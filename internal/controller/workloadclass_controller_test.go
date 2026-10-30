@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -38,6 +40,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -136,6 +139,9 @@ var _ = Describe("WorkloadClass Controller", func() {
 		AfterEach(func() {
 			By("cleaning up all WorkloadClasses in the namespace")
 			Expect(k8sClient.DeleteAllOf(ctx, &workloadsv1alpha1.WorkloadClass{}, client.InNamespace(namespace))).To(Succeed())
+
+			By("cleaning up all Pods in the namespace")
+			deleteAllPods(namespace)
 
 			By("cleaning up the WorkloadClassGuardrails")
 			for _, name := range []string{guardrailName, guardrailName + "-2"} {
@@ -374,18 +380,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 					Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
 				}
 				Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-				DeferCleanup(func() {
-					current := &corev1.Pod{}
-					if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), current); err != nil {
-						Expect(errors.IsNotFound(err)).To(BeTrue())
-						return
-					}
-					if len(current.Finalizers) > 0 {
-						current.Finalizers = nil
-						Expect(k8sClient.Update(ctx, current)).To(Succeed())
-					}
-					Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, current, client.GracePeriodSeconds(0)))).To(Succeed())
-				})
 				return pod
 			}
 
@@ -493,7 +487,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 				Expect(result.RequeueAfter).To(Equal(wc.CreationTimestamp.Add(7*24*time.Hour).Sub(now) + transitionRequeueDelay))
 			})
 
-			It("should be NotReady while selected Pods terminate within GraceTerminationDurationSeconds", func() {
+			It("should be NotReady for GraceTerminationDurationSeconds after a selected Pod starts terminating, even once the Pod is gone", func() {
 				updateWorkloadClass(func(wc *workloadsv1alpha1.WorkloadClass) {
 					wc.Spec.DisruptionPolicy.GraceTerminationDurationSeconds = 60
 				})
@@ -501,18 +495,41 @@ var _ = Describe("WorkloadClass Controller", func() {
 				Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
 				Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod)).To(Succeed())
 				Expect(pod.DeletionTimestamp).NotTo(BeNil())
+				terminationStart := podTerminationStart(pod)
 
-				By("being NotReady, and requeueing when the grace period passes")
-				now := pod.DeletionTimestamp.Add(10 * time.Second)
+				By("recording when the Pod started terminating, being NotReady, and requeueing when the grace period passes")
+				now := terminationStart.Add(10 * time.Second)
 				result, wc := reconcileAt(now)
+				Expect(wc.Status.LastPodTerminationTime).NotTo(BeNil())
+				Expect(wc.Status.LastPodTerminationTime.Time).To(BeTemporally("==", terminationStart))
 				expectReadiness(wc, workloadsv1alpha1.ReadinessNotReady, metav1.ConditionFalse,
 					workloadsv1alpha1.ReasonGraceTerminationInProgress)
 				Expect(result.RequeueAfter).To(Equal(50*time.Second + transitionRequeueDelay))
 
+				By("staying NotReady after the Pod is gone")
+				pod.Finalizers = nil
+				Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+				Eventually(func() error {
+					return k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{})
+				}).Should(MatchError(errors.IsNotFound, "IsNotFound"))
+				result, wc = reconcileAt(now.Add(20 * time.Second))
+				expectReadiness(wc, workloadsv1alpha1.ReadinessNotReady, metav1.ConditionFalse,
+					workloadsv1alpha1.ReasonGraceTerminationInProgress)
+				Expect(result.RequeueAfter).To(Equal(30*time.Second + transitionRequeueDelay))
+
 				By("being Ready once the grace period passes")
-				_, wc = reconcileAt(now.Add(result.RequeueAfter))
+				_, wc = reconcileAt(terminationStart.Add(60 * time.Second))
 				expectReadiness(wc, workloadsv1alpha1.ReadinessReady, metav1.ConditionTrue,
 					workloadsv1alpha1.ReasonWithinDisruptionWindow)
+			})
+
+			It("should be Unknown with reason SelectorOverlap when the PodSelector overlaps with another WorkloadClass", func() {
+				Expect(k8sClient.Create(ctx, newWorkloadClass("test-workloadclass-overlapping"))).To(Succeed())
+
+				result, wc := reconcileAt(time.Now())
+				expectReadiness(wc, workloadsv1alpha1.ReadinessUnknown, metav1.ConditionUnknown,
+					workloadsv1alpha1.ReasonSelectorOverlap)
+				Expect(result.RequeueAfter).To(BeZero())
 			})
 		})
 	})
@@ -558,6 +575,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Eventually(mgrDone).Should(Receive(BeNil()))
 
 			Expect(k8sClient.DeleteAllOf(ctx, &workloadsv1alpha1.WorkloadClass{}, client.InNamespace(namespace))).To(Succeed())
+			deleteAllPods(namespace)
 			g := &workloadsv1alpha1.WorkloadClassGuardrail{ObjectMeta: metav1.ObjectMeta{Name: guardrailName}}
 			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, g))).To(Succeed())
 		})
@@ -700,8 +718,64 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, pod)).To(Succeed())
 			eventuallyReadiness(workloadsv1alpha1.ReadinessReady, workloadsv1alpha1.ReasonWithinDisruptionWindow)
 		})
+
+		It("should re-calculate maintenance readiness when lastDisruptionTime changes", func() {
+			const wcName = "wc-watched-disruption"
+			key := types.NamespacedName{Name: wcName, Namespace: namespace}
+			wc := &workloadsv1alpha1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: wcName, Namespace: namespace},
+				Spec: workloadsv1alpha1.WorkloadClassSpec{
+					PodSelector:      &metav1.LabelSelector{MatchLabels: map[string]string{"app": "disruption-watched"}},
+					DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{MaxNonDisruptionDurationDays: 7},
+				},
+			}
+			Expect(k8sClient.Create(ctx, wc)).To(Succeed())
+
+			eventuallyReadiness := func(readiness workloadsv1alpha1.MaintenanceReadiness) {
+				GinkgoHelper()
+				Eventually(func(g Gomega) {
+					current := &workloadsv1alpha1.WorkloadClass{}
+					g.Expect(k8sClient.Get(ctx, key, current)).To(Succeed())
+					g.Expect(current.Status.MaintenanceReadiness).To(Equal(readiness))
+				}).Should(Succeed())
+			}
+			eventuallyReadiness(workloadsv1alpha1.ReadinessReady)
+
+			By("recording a disruption older than MaxNonDisruptionDurationDays")
+			Expect(k8sClient.Get(ctx, key, wc)).To(Succeed())
+			patch := client.MergeFrom(wc.DeepCopy())
+			wc.Status.LastDisruptionTime = &metav1.Time{Time: time.Now().AddDate(0, 0, -10)}
+			Expect(k8sClient.Status().Patch(ctx, wc, patch)).To(Succeed())
+			eventuallyReadiness(workloadsv1alpha1.ReadinessOverdue)
+
+			By("recording a recent disruption")
+			Expect(k8sClient.Get(ctx, key, wc)).To(Succeed())
+			patch = client.MergeFrom(wc.DeepCopy())
+			wc.Status.LastDisruptionTime = &metav1.Time{Time: time.Now()}
+			Expect(k8sClient.Status().Patch(ctx, wc, patch)).To(Succeed())
+			eventuallyReadiness(workloadsv1alpha1.ReadinessReady)
+		})
 	})
 })
+
+// deleteAllPods removes the finalizers of every Pod in the namespace and deletes the Pods immediately.
+func deleteAllPods(namespace string) {
+	GinkgoHelper()
+	pods := &corev1.PodList{}
+	Expect(k8sClient.List(ctx, pods, client.InNamespace(namespace))).To(Succeed())
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if len(pod.Finalizers) > 0 {
+			pod.Finalizers = nil
+			Expect(client.IgnoreNotFound(k8sClient.Update(ctx, pod))).To(Succeed())
+		}
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, pod, client.GracePeriodSeconds(0)))).To(Succeed())
+	}
+	Eventually(func(g Gomega) {
+		g.Expect(k8sClient.List(ctx, pods, client.InNamespace(namespace))).To(Succeed())
+		g.Expect(pods.Items).To(BeEmpty())
+	}).Should(Succeed())
+}
 
 func newTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -1165,17 +1239,34 @@ func TestMinInitialRunPassed(t *testing.T) {
 	testCases := []struct {
 		name          string
 		created       time.Time
+		started       *time.Time
 		wantPassed    bool
 		wantRemaining time.Duration
 	}{
 		{name: "just_created", created: now, wantRemaining: 48 * time.Hour},
-		{name: "running_for_one_day", created: now.Add(-24 * time.Hour), wantRemaining: 24 * time.Hour},
-		{name: "running_for_exactly_min_duration", created: now.Add(-48 * time.Hour), wantPassed: true},
-		{name: "running_for_longer_than_min_duration", created: now.AddDate(0, 0, -10), wantPassed: true},
+		{name: "pending_for_one_day", created: now.Add(-24 * time.Hour), wantRemaining: 24 * time.Hour},
+		{name: "pending_for_exactly_min_duration", created: now.Add(-48 * time.Hour), wantPassed: true},
+		{name: "pending_for_longer_than_min_duration", created: now.AddDate(0, 0, -10), wantPassed: true},
+		{
+			name:          "created_long_ago_but_started_recently",
+			created:       now.AddDate(0, 0, -10),
+			started:       ptr.To(now.Add(-24 * time.Hour)),
+			wantRemaining: 24 * time.Hour,
+		},
+		{
+			name:       "started_longer_than_min_duration_ago",
+			created:    now.AddDate(0, 0, -10),
+			started:    ptr.To(now.Add(-49 * time.Hour)),
+			wantPassed: true,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotPassed, gotRemaining := minInitialRunPassed(wc, testPod("pod", nil, tc.created), now)
+			pod := testPod("pod", nil, tc.created)
+			if tc.started != nil {
+				pod.Status.StartTime = ptr.To(metav1.NewTime(*tc.started))
+			}
+			gotPassed, gotRemaining := minInitialRunPassed(wc, pod, now)
 			if gotPassed != tc.wantPassed || gotRemaining != tc.wantRemaining {
 				t.Errorf("minInitialRunPassed() = (%v, %v), want (%v, %v)", gotPassed, gotRemaining, tc.wantPassed, tc.wantRemaining)
 			}
@@ -1189,20 +1280,21 @@ func TestGracePeriodPassed(t *testing.T) {
 	testCases := []struct {
 		name          string
 		grace         int32
-		deleted       *time.Time
+		lastTerminate *time.Time
 		wantPassed    bool
 		wantRemaining time.Duration
 	}{
-		{name: "not_terminating", grace: 30, wantPassed: true},
-		{name: "terminating_within_grace_period", grace: 30, deleted: ptr.To(now), wantRemaining: 30 * time.Second},
+		{name: "no_pod_observed_terminating", grace: 30, wantPassed: true},
+		{name: "terminating_now", grace: 30, lastTerminate: ptr.To(now), wantRemaining: 30 * time.Second},
 		{
 			name:          "terminating_partway_through_grace_period",
 			grace:         30,
-			deleted:       ptr.To(now.Add(-10 * time.Second)),
+			lastTerminate: ptr.To(now.Add(-10 * time.Second)),
 			wantRemaining: 20 * time.Second,
 		},
-		{name: "terminating_beyond_grace_period", grace: 86400, deleted: ptr.To(now.AddDate(0, 0, -2)), wantPassed: true},
-		{name: "terminating_without_grace_period", grace: 0, deleted: ptr.To(now), wantPassed: true},
+		{name: "terminated_exactly_grace_period_ago", grace: 30, lastTerminate: ptr.To(now.Add(-30 * time.Second)), wantPassed: true},
+		{name: "terminated_beyond_grace_period", grace: 86400, lastTerminate: ptr.To(now.AddDate(0, 0, -2)), wantPassed: true},
+		{name: "grace_period_unset", grace: 0, lastTerminate: ptr.To(now), wantPassed: true},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1211,12 +1303,11 @@ func TestGracePeriodPassed(t *testing.T) {
 					DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{GraceTerminationDurationSeconds: tc.grace},
 				},
 			}
-			pod := testPod("pod", nil, now.AddDate(0, 0, -10))
-			if tc.deleted != nil {
-				pod.DeletionTimestamp = ptr.To(metav1.NewTime(*tc.deleted))
+			if tc.lastTerminate != nil {
+				wc.Status.LastPodTerminationTime = ptr.To(metav1.NewTime(*tc.lastTerminate))
 			}
 
-			gotPassed, gotRemaining := gracePeriodPassed(wc, pod, now)
+			gotPassed, gotRemaining := gracePeriodPassed(wc, now)
 			if gotPassed != tc.wantPassed || gotRemaining != tc.wantRemaining {
 				t.Errorf("gracePeriodPassed() = (%v, %v), want (%v, %v)", gotPassed, gotRemaining, tc.wantPassed, tc.wantRemaining)
 			}
@@ -1224,61 +1315,92 @@ func TestGracePeriodPassed(t *testing.T) {
 	}
 }
 
-func TestEvaluatePodGracePeriod(t *testing.T) {
+func TestRecordPodTerminations(t *testing.T) {
 	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
-	wc := &workloadsv1alpha1.WorkloadClass{
-		Spec: workloadsv1alpha1.WorkloadClassSpec{
-			DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{GraceTerminationDurationSeconds: 3600},
-		},
+	created := now.AddDate(0, 0, -5)
+
+	withGrace := func(pod *corev1.Pod, seconds int64) *corev1.Pod {
+		pod.DeletionGracePeriodSeconds = ptr.To(seconds)
+		return pod
 	}
+	succeeded := terminatingTestPod("succeeded", nil, created, now)
+	succeeded.Status.Phase = corev1.PodSucceeded
 
 	testCases := []struct {
-		name          string
-		deleted       time.Time
-		initialPassed bool
-		initialMax    time.Duration
-		wantPassed    bool
-		wantMax       time.Duration
+		name     string
+		existing *time.Time
+		pods     []corev1.Pod
+		want     *time.Time
 	}{
 		{
-			name:          "passed_and_previous_passed",
-			deleted:       now.Add(-2 * time.Hour),
-			initialPassed: true,
-			wantPassed:    true,
+			name: "no_terminating_pods_leaves_it_unset",
+			pods: []corev1.Pod{*testPod("running", nil, created)},
 		},
 		{
-			name:          "not_passed_and_previous_passed",
-			deleted:       now.Add(-15 * time.Minute),
-			initialPassed: true,
-			wantMax:       45 * time.Minute,
+			name:     "no_terminating_pods_keeps_the_existing_time",
+			existing: ptr.To(now.Add(-time.Hour)),
+			pods:     []corev1.Pod{*testPod("running", nil, created)},
+			want:     ptr.To(now.Add(-time.Hour)),
 		},
 		{
-			name:       "passed_and_previous_not_passed_keeps_previous_remaining",
-			deleted:    now.Add(-2 * time.Hour),
-			initialMax: 30 * time.Second,
-			wantMax:    30 * time.Second,
+			name: "records_the_most_recent_termination_start",
+			pods: []corev1.Pod{
+				*terminatingTestPod("older", nil, created, now.Add(-10*time.Minute)),
+				*terminatingTestPod("newer", nil, created, now.Add(-time.Minute)),
+			},
+			want: ptr.To(now.Add(-time.Minute)),
 		},
 		{
-			name:       "not_passed_with_longer_remaining_than_previous",
-			deleted:    now.Add(-15 * time.Minute),
-			initialMax: 30 * time.Second,
-			wantMax:    45 * time.Minute,
+			name: "subtracts_the_deletion_grace_period",
+			pods: []corev1.Pod{*withGrace(terminatingTestPod("graceful", nil, created, now), 30)},
+			want: ptr.To(now.Add(-30 * time.Second)),
 		},
 		{
-			name:       "not_passed_with_shorter_remaining_than_previous",
-			deleted:    now.Add(-15 * time.Minute),
-			initialMax: 50 * time.Minute,
-			wantMax:    50 * time.Minute,
+			name:     "does_not_move_backwards",
+			existing: ptr.To(now),
+			pods:     []corev1.Pod{*terminatingTestPod("older", nil, created, now.Add(-time.Hour))},
+			want:     ptr.To(now),
+		},
+		{
+			name: "ignores_pods_in_a_terminal_phase",
+			pods: []corev1.Pod{*succeeded},
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			pod := terminatingTestPod("pod", nil, now.AddDate(0, 0, -10), tc.deleted)
-			gotPassed, gotMax := evaluatePodGracePeriod(wc, pod, now, tc.initialPassed, tc.initialMax)
-			if gotPassed != tc.wantPassed || gotMax != tc.wantMax {
-				t.Errorf("evaluatePodGracePeriod() = (%v, %v), want (%v, %v)", gotPassed, gotMax, tc.wantPassed, tc.wantMax)
+			wc := &workloadsv1alpha1.WorkloadClass{}
+			if tc.existing != nil {
+				wc.Status.LastPodTerminationTime = ptr.To(metav1.NewTime(*tc.existing))
+			}
+			recordPodTerminations(wc, tc.pods)
+
+			got := wc.Status.LastPodTerminationTime
+			switch {
+			case got == nil && tc.want == nil:
+			case got == nil || tc.want == nil || !got.Time.Equal(*tc.want):
+				t.Errorf("recordPodTerminations() set LastPodTerminationTime = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestDays(t *testing.T) {
+	if got := days(2); got != 48*time.Hour {
+		t.Errorf("days(2) = %v, want 48h", got)
+	}
+	if got := days(math.MaxInt32); got != math.MaxInt64 {
+		t.Errorf("days(MaxInt32) = %v, want MaxInt64", got)
+	}
+	// A saturated duration must still count as "not elapsed", not wrap around to an elapsed negative duration.
+	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
+	wc := &workloadsv1alpha1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.AddDate(-1, 0, 0))},
+		Spec: workloadsv1alpha1.WorkloadClassSpec{
+			DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{MaxNonDisruptionDurationDays: math.MaxInt32},
+		},
+	}
+	if isOverdue, _ := overdue(wc, now); isOverdue {
+		t.Error("overdue() = true for MaxNonDisruptionDurationDays = MaxInt32, want false")
 	}
 }
 
@@ -1287,7 +1409,12 @@ func TestCalculateReadiness(t *testing.T) {
 	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
 	selected := map[string]string{"app": "nginx"}
 	validated := metav1.Condition{Type: workloadsv1alpha1.ConditionTypeValidated, Status: metav1.ConditionTrue}
-	notValidated := metav1.Condition{Type: workloadsv1alpha1.ConditionTypeValidated, Status: metav1.ConditionFalse}
+	notValidated := metav1.Condition{
+		Type: workloadsv1alpha1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1alpha1.ReasonValidationFailed,
+	}
+	overlapping := metav1.Condition{
+		Type: workloadsv1alpha1.ConditionTypeValidated, Status: metav1.ConditionFalse, Reason: workloadsv1alpha1.ReasonSelectorOverlap,
+	}
 	// The window opens 2h before now and closes 3h after now.
 	openWindow := workloadsv1alpha1.DisruptionWindow{Name: "open", StartTime: "10:00", EndTime: "15:00"}
 	// The window opens 10h after now.
@@ -1299,16 +1426,20 @@ func TestCalculateReadiness(t *testing.T) {
 		mutate(&wc.Spec.DisruptionPolicy)
 		return wc
 	}
+	withPhase := func(pod *corev1.Pod, phase corev1.PodPhase) *corev1.Pod {
+		pod.Status.Phase = phase
+		return pod
+	}
 
 	testCases := []struct {
-		name          string
-		wc            *workloadsv1alpha1.WorkloadClass
-		validated     metav1.Condition
-		pods          []client.Object
-		wantReadiness workloadsv1alpha1.MaintenanceReadiness
-		wantReason    string
-		wantMessage   string
-		wantRequeue   time.Duration
+		name                string
+		wc                  *workloadsv1alpha1.WorkloadClass
+		validated           metav1.Condition
+		pods                []client.Object
+		wantReadiness       workloadsv1alpha1.MaintenanceReadiness
+		wantReason          string
+		wantRequeue         time.Duration
+		wantLastTermination *time.Time
 	}{
 		{
 			name: "validation_failed_is_unknown",
@@ -1318,7 +1449,13 @@ func TestCalculateReadiness(t *testing.T) {
 			validated:     notValidated,
 			wantReadiness: workloadsv1alpha1.ReadinessUnknown,
 			wantReason:    workloadsv1alpha1.ReasonValidationFailed,
-			wantMessage:   notValidatedMsg,
+		},
+		{
+			name:          "selector_overlap_is_unknown_with_its_own_reason",
+			wc:            newWC(func(*workloadsv1alpha1.DisruptionPolicy) {}),
+			validated:     overlapping,
+			wantReadiness: workloadsv1alpha1.ReadinessUnknown,
+			wantReason:    workloadsv1alpha1.ReasonSelectorOverlap,
 		},
 		{
 			name: "emergency_override_is_ready_outside_of_windows",
@@ -1329,7 +1466,18 @@ func TestCalculateReadiness(t *testing.T) {
 			validated:     validated,
 			wantReadiness: workloadsv1alpha1.ReadinessReady,
 			wantReason:    workloadsv1alpha1.ReasonEmergencyOverride,
-			wantMessage:   emergencyOverrideMsg,
+		},
+		{
+			name: "emergency_override_still_records_pod_terminations",
+			wc: newWC(func(p *workloadsv1alpha1.DisruptionPolicy) {
+				p.GraceTerminationDurationSeconds = 600
+				p.EmergencyOverride = true
+			}),
+			validated:           validated,
+			pods:                []client.Object{terminatingTestPod("terminating", selected, now.AddDate(0, 0, -5), now.Add(-time.Minute))},
+			wantReadiness:       workloadsv1alpha1.ReadinessReady,
+			wantReason:          workloadsv1alpha1.ReasonEmergencyOverride,
+			wantLastTermination: ptr.To(now.Add(-time.Minute)),
 		},
 		{
 			name: "overdue_outside_of_windows",
@@ -1340,7 +1488,6 @@ func TestCalculateReadiness(t *testing.T) {
 			validated:     validated,
 			wantReadiness: workloadsv1alpha1.ReadinessOverdue,
 			wantReason:    workloadsv1alpha1.ReasonMaintenanceOverdue,
-			wantMessage:   overdueMsg,
 		},
 		{
 			name: "overdue_takes_precedence_over_young_pods",
@@ -1352,7 +1499,6 @@ func TestCalculateReadiness(t *testing.T) {
 			pods:          []client.Object{testPod("young", selected, now)},
 			wantReadiness: workloadsv1alpha1.ReadinessOverdue,
 			wantReason:    workloadsv1alpha1.ReasonMaintenanceOverdue,
-			wantMessage:   overdueMsg,
 		},
 		{
 			name: "outside_of_windows_requeues_when_the_next_window_opens",
@@ -1363,7 +1509,6 @@ func TestCalculateReadiness(t *testing.T) {
 			validated:     validated,
 			wantReadiness: workloadsv1alpha1.ReadinessNotReady,
 			wantReason:    workloadsv1alpha1.ReasonOutsideDisruptionWindow,
-			wantMessage:   outsideWindowMsg,
 			wantRequeue:   10*time.Hour + transitionRequeueDelay,
 		},
 		{
@@ -1377,7 +1522,6 @@ func TestCalculateReadiness(t *testing.T) {
 			validated:     validated,
 			wantReadiness: workloadsv1alpha1.ReadinessNotReady,
 			wantReason:    workloadsv1alpha1.ReasonOutsideDisruptionWindow,
-			wantMessage:   outsideWindowMsg,
 			wantRequeue:   24*time.Hour + transitionRequeueDelay,
 		},
 		{
@@ -1388,7 +1532,6 @@ func TestCalculateReadiness(t *testing.T) {
 			validated:     validated,
 			wantReadiness: workloadsv1alpha1.ReadinessReady,
 			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
-			wantMessage:   withinWindowMsg,
 			wantRequeue:   3*time.Hour + transitionRequeueDelay,
 		},
 		{
@@ -1399,7 +1542,6 @@ func TestCalculateReadiness(t *testing.T) {
 			validated:     validated,
 			wantReadiness: workloadsv1alpha1.ReadinessReady,
 			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
-			wantMessage:   noWindowsMsg,
 			wantRequeue:   6*24*time.Hour + transitionRequeueDelay,
 		},
 		{
@@ -1408,7 +1550,6 @@ func TestCalculateReadiness(t *testing.T) {
 			validated:     validated,
 			wantReadiness: workloadsv1alpha1.ReadinessReady,
 			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
-			wantMessage:   noWindowsMsg,
 		},
 		{
 			name: "young_pods_requeue_when_the_youngest_has_run_long_enough",
@@ -1423,7 +1564,6 @@ func TestCalculateReadiness(t *testing.T) {
 			},
 			wantReadiness: workloadsv1alpha1.ReadinessNotReady,
 			wantReason:    workloadsv1alpha1.ReasonMinInitialRunDurationNotMet,
-			wantMessage:   minInitialRunMsg,
 			wantRequeue:   5*time.Hour + transitionRequeueDelay,
 		},
 		{
@@ -1436,7 +1576,6 @@ func TestCalculateReadiness(t *testing.T) {
 			pods:          []client.Object{testPod("young", selected, now)},
 			wantReadiness: workloadsv1alpha1.ReadinessNotReady,
 			wantReason:    workloadsv1alpha1.ReasonMinInitialRunDurationNotMet,
-			wantMessage:   minInitialRunMsg,
 			wantRequeue:   3*time.Hour + transitionRequeueDelay,
 		},
 		{
@@ -1455,7 +1594,6 @@ func TestCalculateReadiness(t *testing.T) {
 			},
 			wantReadiness: workloadsv1alpha1.ReadinessReady,
 			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
-			wantMessage:   noWindowsMsg,
 		},
 		{
 			name: "young_pods_in_a_terminal_phase_do_not_block",
@@ -1464,20 +1602,11 @@ func TestCalculateReadiness(t *testing.T) {
 			}),
 			validated: validated,
 			pods: []client.Object{
-				func() client.Object {
-					pod := testPod("succeeded", selected, now)
-					pod.Status.Phase = corev1.PodSucceeded
-					return pod
-				}(),
-				func() client.Object {
-					pod := testPod("failed", selected, now)
-					pod.Status.Phase = corev1.PodFailed
-					return pod
-				}(),
+				withPhase(testPod("succeeded", selected, now), corev1.PodSucceeded),
+				withPhase(testPod("failed", selected, now), corev1.PodFailed),
 			},
 			wantReadiness: workloadsv1alpha1.ReadinessReady,
 			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
-			wantMessage:   noWindowsMsg,
 		},
 		{
 			name: "nil_pod_selector_selects_no_pods",
@@ -1492,7 +1621,6 @@ func TestCalculateReadiness(t *testing.T) {
 			pods:          []client.Object{testPod("young", selected, now)},
 			wantReadiness: workloadsv1alpha1.ReadinessReady,
 			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
-			wantMessage:   noWindowsMsg,
 		},
 		{
 			name: "terminating_pods_within_grace_period_requeue_when_the_last_grace_period_passes",
@@ -1504,32 +1632,47 @@ func TestCalculateReadiness(t *testing.T) {
 				terminatingTestPod("terminating", selected, now.AddDate(0, 0, -5), now.Add(-8*time.Minute)),
 				terminatingTestPod("just-terminating", selected, now.AddDate(0, 0, -5), now.Add(-time.Minute)),
 			},
-			wantReadiness: workloadsv1alpha1.ReadinessNotReady,
-			wantReason:    workloadsv1alpha1.ReasonGraceTerminationInProgress,
-			wantMessage:   graceTerminationMsg,
-			wantRequeue:   9*time.Minute + transitionRequeueDelay,
+			wantReadiness:       workloadsv1alpha1.ReadinessNotReady,
+			wantReason:          workloadsv1alpha1.ReasonGraceTerminationInProgress,
+			wantRequeue:         9*time.Minute + transitionRequeueDelay,
+			wantLastTermination: ptr.To(now.Add(-time.Minute)),
+		},
+		{
+			name: "pod_that_terminated_and_is_gone_still_blocks_within_grace_period",
+			wc: func() *workloadsv1alpha1.WorkloadClass {
+				wc := newWC(func(p *workloadsv1alpha1.DisruptionPolicy) {
+					p.GraceTerminationDurationSeconds = 600
+				})
+				wc.Status.LastPodTerminationTime = ptr.To(metav1.NewTime(now.Add(-4 * time.Minute)))
+				return wc
+			}(),
+			validated:           validated,
+			wantReadiness:       workloadsv1alpha1.ReadinessNotReady,
+			wantReason:          workloadsv1alpha1.ReasonGraceTerminationInProgress,
+			wantRequeue:         6*time.Minute + transitionRequeueDelay,
+			wantLastTermination: ptr.To(now.Add(-4 * time.Minute)),
 		},
 		{
 			name: "terminating_pods_beyond_grace_period_do_not_block",
 			wc: newWC(func(p *workloadsv1alpha1.DisruptionPolicy) {
 				p.GraceTerminationDurationSeconds = 600
 			}),
-			validated:     validated,
-			pods:          []client.Object{terminatingTestPod("terminated", selected, now.AddDate(0, 0, -5), now.Add(-time.Hour))},
-			wantReadiness: workloadsv1alpha1.ReadinessReady,
-			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
-			wantMessage:   noWindowsMsg,
+			validated:           validated,
+			pods:                []client.Object{terminatingTestPod("terminated", selected, now.AddDate(0, 0, -5), now.Add(-time.Hour))},
+			wantReadiness:       workloadsv1alpha1.ReadinessReady,
+			wantReason:          workloadsv1alpha1.ReasonWithinDisruptionWindow,
+			wantLastTermination: ptr.To(now.Add(-time.Hour)),
 		},
 		{
 			name: "terminating_young_pods_are_only_subject_to_the_grace_period",
 			wc: newWC(func(p *workloadsv1alpha1.DisruptionPolicy) {
 				p.MinInitialRunDurationDays = 1
 			}),
-			validated:     validated,
-			pods:          []client.Object{terminatingTestPod("young-terminating", selected, now, now)},
-			wantReadiness: workloadsv1alpha1.ReadinessReady,
-			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
-			wantMessage:   noWindowsMsg,
+			validated:           validated,
+			pods:                []client.Object{terminatingTestPod("young-terminating", selected, now, now)},
+			wantReadiness:       workloadsv1alpha1.ReadinessReady,
+			wantReason:          workloadsv1alpha1.ReasonWithinDisruptionWindow,
+			wantLastTermination: ptr.To(now),
 		},
 		{
 			name: "young_and_terminating_pods_report_min_initial_run_until_it_passes",
@@ -1542,10 +1685,10 @@ func TestCalculateReadiness(t *testing.T) {
 				testPod("young", selected, now.Add(-23*time.Hour)),
 				terminatingTestPod("terminating", selected, now.AddDate(0, 0, -5), now),
 			},
-			wantReadiness: workloadsv1alpha1.ReadinessNotReady,
-			wantReason:    workloadsv1alpha1.ReasonMinInitialRunDurationNotMet,
-			wantMessage:   minInitialRunMsg,
-			wantRequeue:   time.Hour + transitionRequeueDelay,
+			wantReadiness:       workloadsv1alpha1.ReadinessNotReady,
+			wantReason:          workloadsv1alpha1.ReasonMinInitialRunDurationNotMet,
+			wantRequeue:         time.Hour + transitionRequeueDelay,
+			wantLastTermination: ptr.To(now),
 		},
 	}
 	for _, tc := range testCases {
@@ -1561,16 +1704,139 @@ func TestCalculateReadiness(t *testing.T) {
 			if err != nil {
 				t.Fatalf("calculateReadiness() returned unexpected error: %v", err)
 			}
-			want := readinessResult{
-				readiness:    tc.wantReadiness,
-				reason:       tc.wantReason,
-				message:      tc.wantMessage,
-				requeueAfter: tc.wantRequeue,
+			if got.readiness != tc.wantReadiness || got.reason != tc.wantReason || got.requeueAfter != tc.wantRequeue {
+				t.Errorf("calculateReadiness() = (%s, %s, requeue %v), want (%s, %s, requeue %v)",
+					got.readiness, got.reason, got.requeueAfter, tc.wantReadiness, tc.wantReason, tc.wantRequeue)
 			}
-			if got != want {
-				t.Errorf("calculateReadiness() = %+v, want %+v", got, want)
+			if got.message == "" {
+				t.Error("calculateReadiness() returned an empty message")
+			}
+			last := tc.wc.Status.LastPodTerminationTime
+			switch {
+			case last == nil && tc.wantLastTermination == nil:
+			case last == nil || tc.wantLastTermination == nil || !last.Time.Equal(*tc.wantLastTermination):
+				t.Errorf("calculateReadiness() set LastPodTerminationTime = %v, want %v", last, tc.wantLastTermination)
 			}
 		})
+	}
+}
+
+func TestReadinessMessages(t *testing.T) {
+	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
+	selected := map[string]string{"app": "nginx"}
+	validated := metav1.Condition{Type: workloadsv1alpha1.ConditionTypeValidated, Status: metav1.ConditionTrue}
+
+	testCases := []struct {
+		name   string
+		policy workloadsv1alpha1.DisruptionPolicy
+		status workloadsv1alpha1.WorkloadClassStatus
+		pods   []client.Object
+		want   string
+	}{
+		{
+			name:   "outside_window_names_the_next_opening",
+			policy: workloadsv1alpha1.DisruptionPolicy{AllowedDisruptionWindows: []workloadsv1alpha1.DisruptionWindow{{Name: "w", StartTime: "22:00", EndTime: "23:00"}}},
+			want:   "The current time is outside of every allowed disruption window; the next window opens at 2026-04-20T22:00:00Z",
+		},
+		{
+			name:   "within_window_names_the_closing",
+			policy: workloadsv1alpha1.DisruptionPolicy{AllowedDisruptionWindows: []workloadsv1alpha1.DisruptionWindow{{Name: "w", StartTime: "10:00", EndTime: "15:00"}}},
+			want:   "The current time is within an allowed disruption window; the window closes at 2026-04-20T15:00:00Z",
+		},
+		{
+			name:   "young_pods_are_counted_and_named",
+			policy: workloadsv1alpha1.DisruptionPolicy{MinInitialRunDurationDays: 1},
+			pods: []client.Object{
+				testPod("a", selected, now.Add(-20*time.Hour)),
+				testPod("b", selected, now.Add(-22*time.Hour)),
+			},
+			want: "2 selected Pods (e.g. 'a') have not yet run for `minInitialRunDurationDays`; the last one will at 2026-04-20T16:00:00Z",
+		},
+		{
+			name:   "single_young_pod",
+			policy: workloadsv1alpha1.DisruptionPolicy{MinInitialRunDurationDays: 1},
+			pods:   []client.Object{testPod("a", selected, now.Add(-20*time.Hour))},
+			want:   "1 selected Pod (e.g. 'a') has not yet run for `minInitialRunDurationDays`; the last one will at 2026-04-20T16:00:00Z",
+		},
+		{
+			name:   "grace_period_names_both_times",
+			policy: workloadsv1alpha1.DisruptionPolicy{GraceTerminationDurationSeconds: 600},
+			status: workloadsv1alpha1.WorkloadClassStatus{LastPodTerminationTime: ptr.To(metav1.NewTime(now.Add(-4 * time.Minute)))},
+			want:   "A selected Pod started terminating at 2026-04-20T11:56:00Z; `graceTerminationDurationSeconds` passes at 2026-04-20T12:06:00Z",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			wc := testWorkloadClass("wc", "ns", selected)
+			wc.CreationTimestamp = metav1.NewTime(now.AddDate(0, 0, -1))
+			wc.Spec.DisruptionPolicy = tc.policy
+			wc.Status = tc.status
+
+			scheme := newTestScheme(t)
+			r := &WorkloadClassReconciler{
+				Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.pods...).Build(),
+				Scheme: scheme,
+				Clock:  clocktesting.NewFakePassiveClock(now),
+			}
+			got, err := r.calculateReadiness(t.Context(), wc, validated)
+			if err != nil {
+				t.Fatalf("calculateReadiness() returned unexpected error: %v", err)
+			}
+			if !strings.HasPrefix(got.message, tc.want) {
+				t.Errorf("calculateReadiness() message = %q, want %q", got.message, tc.want)
+			}
+		})
+	}
+}
+
+func TestReconcileReadinessCheckFailed(t *testing.T) {
+	wc := testWorkloadClass("wc", "ns", map[string]string{"app": "nginx"})
+	wc.Spec.DisruptionPolicy.MinInitialRunDurationDays = 1
+	wc.Generation = 3
+
+	scheme := newTestScheme(t)
+	listErr := fmt.Errorf("pods are unavailable")
+	r := &WorkloadClassReconciler{
+		Client: fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(wc).
+			WithStatusSubresource(wc).
+			WithInterceptorFuncs(interceptor.Funcs{
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*corev1.PodList); ok {
+						return listErr
+					}
+					return c.List(ctx, list, opts...)
+				},
+			}).
+			Build(),
+		Scheme: scheme,
+	}
+
+	result, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(wc)})
+	if !stderrors.Is(err, listErr) {
+		t.Fatalf("Reconcile() error = %v, want %v", err, listErr)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("Reconcile() RequeueAfter = %v, want 0 (the error triggers a retry with backoff)", result.RequeueAfter)
+	}
+
+	got := &workloadsv1alpha1.WorkloadClass{}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(wc), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.MaintenanceReadiness != workloadsv1alpha1.ReadinessUnknown {
+		t.Errorf("MaintenanceReadiness = %s, want %s", got.Status.MaintenanceReadiness, workloadsv1alpha1.ReadinessUnknown)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, workloadsv1alpha1.ConditionTypeMaintenanceAllowed)
+	if cond == nil {
+		t.Fatal("MaintenanceAllowed condition not set")
+	}
+	if cond.Status != metav1.ConditionUnknown || cond.Reason != workloadsv1alpha1.ReasonReadinessCheckFailed || cond.ObservedGeneration != 3 {
+		t.Errorf("MaintenanceAllowed = %+v, want Unknown/ReadinessCheckFailed with ObservedGeneration 3", cond)
+	}
+	if !strings.Contains(cond.Message, listErr.Error()) {
+		t.Errorf("MaintenanceAllowed message = %q, want it to contain %q", cond.Message, listErr.Error())
 	}
 }
 
@@ -1600,6 +1866,13 @@ func TestReadinessResultCondition(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("long_message_is_truncated", func(t *testing.T) {
+		result := readinessResult{readiness: workloadsv1alpha1.ReadinessReady, reason: "R", message: strings.Repeat("x", maxConditionMessageLen+1)}
+		if got := len(result.condition(1).Message); got != maxConditionMessageLen {
+			t.Errorf("condition() message length = %d, want %d", got, maxConditionMessageLen)
+		}
+	})
 }
 
 func TestPodReadinessPredicate(t *testing.T) {
@@ -1636,7 +1909,12 @@ func TestPodReadinessPredicate(t *testing.T) {
 			want:   true,
 		},
 		{
-			name:   "becomes_running",
+			name:   "starts_running",
+			newPod: withChange(func(p *corev1.Pod) { p.Status.StartTime = ptr.To(metav1.Now()) }),
+			want:   true,
+		},
+		{
+			name:   "becomes_running_without_a_start_time_change",
 			newPod: withChange(func(p *corev1.Pod) { p.Status.Phase = corev1.PodRunning }),
 			want:   false,
 		},
@@ -1658,6 +1936,53 @@ func TestPodReadinessPredicate(t *testing.T) {
 	}
 	if p.Generic(event.GenericEvent{Object: base}) {
 		t.Error("Generic() = true, want false")
+	}
+}
+
+func TestLastDisruptionTimeChangedPredicate(t *testing.T) {
+	now := metav1.Now()
+	base := testWorkloadClass("wc", "ns", nil)
+	withChange := func(mutate func(*workloadsv1alpha1.WorkloadClass)) *workloadsv1alpha1.WorkloadClass {
+		wc := base.DeepCopy()
+		mutate(wc)
+		return wc
+	}
+
+	testCases := []struct {
+		name  string
+		newWC *workloadsv1alpha1.WorkloadClass
+		want  bool
+	}{
+		{
+			name: "other_status_change",
+			newWC: withChange(func(wc *workloadsv1alpha1.WorkloadClass) {
+				wc.Status.MaintenanceReadiness = workloadsv1alpha1.ReadinessReady
+			}),
+			want: false,
+		},
+		{
+			name:  "last_disruption_time_set",
+			newWC: withChange(func(wc *workloadsv1alpha1.WorkloadClass) { wc.Status.LastDisruptionTime = &now }),
+			want:  true,
+		},
+	}
+	p := lastDisruptionTimeChangedPredicate()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: tc.newWC}); got != tc.want {
+				t.Errorf("Update() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	t.Run("same_time_in_different_pointers", func(t *testing.T) {
+		oldWC := withChange(func(wc *workloadsv1alpha1.WorkloadClass) { wc.Status.LastDisruptionTime = ptr.To(now) })
+		newWC := withChange(func(wc *workloadsv1alpha1.WorkloadClass) { wc.Status.LastDisruptionTime = ptr.To(now) })
+		if p.Update(event.UpdateEvent{ObjectOld: oldWC, ObjectNew: newWC}) {
+			t.Error("Update() = true, want false")
+		}
+	})
+	if !p.Create(event.CreateEvent{Object: base}) {
+		t.Error("Create() = false, want true")
 	}
 }
 
@@ -1692,6 +2017,34 @@ func TestWorkloadClassesSelectingPod(t *testing.T) {
 	want := []string{"ns/wc-everything", "ns/wc-nginx"}
 	if !slices.Equal(got, want) {
 		t.Errorf("workloadClassesSelectingPod() = %v, want %v", got, want)
+	}
+}
+
+func TestStripPodForReadiness(t *testing.T) {
+	now := metav1.Now()
+	pod := testPod("pod", map[string]string{"app": "nginx"}, now.Time)
+	pod.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "kubectl"}}
+	pod.Spec = corev1.PodSpec{NodeName: "node-1", Containers: []corev1.Container{{Name: "app", Image: "busybox"}}}
+	pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, StartTime: &now, PodIP: "10.0.0.1"}
+
+	obj, err := StripPodForReadiness(pod)
+	if err != nil {
+		t.Fatalf("StripPodForReadiness() returned unexpected error: %v", err)
+	}
+	got, ok := obj.(*corev1.Pod)
+	if !ok {
+		t.Fatalf("StripPodForReadiness() returned %T, want *corev1.Pod", obj)
+	}
+	if got.ManagedFields != nil || got.Spec.NodeName != "" || got.Spec.Containers != nil || got.Status.PodIP != "" {
+		t.Errorf("StripPodForReadiness() kept fields that the controller does not read: %+v", got)
+	}
+	if got.Labels["app"] != "nginx" || got.Status.Phase != corev1.PodRunning || got.Status.StartTime == nil {
+		t.Errorf("StripPodForReadiness() dropped fields that the controller reads: %+v", got)
+	}
+
+	other := &corev1.ConfigMap{}
+	if obj, err := StripPodForReadiness(other); err != nil || obj != other {
+		t.Errorf("StripPodForReadiness(ConfigMap) = (%v, %v), want the object unchanged", obj, err)
 	}
 }
 

@@ -73,130 +73,65 @@ const windowTransitionSearchDays = 8
 
 // IsTimeInWindows checks if the given time is within any of the defined disruption windows.
 // Returns true if in window, and the duration until the next state change (window opens or closes).
-// The duration is 0 if the state never changes, e.g. when no windows are defined or no window is valid.
+// The duration is 0 if the state never changes, e.g. when no windows are defined, no window is valid, or the windows
+// cover every day of the week.
+//
+// A window includes its start time and excludes its end time. Window times are interpreted in the window's time zone
+// on each calendar day: a time that does not exist on a day because clocks are turned forward is moved to the instant
+// of the change, and a time that exists twice because clocks are turned back is its first occurrence.
 func IsTimeInWindows(ctx context.Context, nowUTC time.Time, windows []workloadsv1alpha1.DisruptionWindow) (bool, time.Duration) {
 	log := logf.FromContext(ctx)
 	if len(windows) == 0 {
-		log.Info("WorkloadClass does not contain AllowedDisruptionWindows")
+		log.V(1).Info("WorkloadClass does not contain AllowedDisruptionWindows")
 		return true, 0
 	}
 
-	inWindow := false
+	parsed := make([]parsedWindow, 0, len(windows))
 	for _, w := range windows {
-		inCurrentWindow, err := windowContains(nowUTC, w)
+		p, err := parseWindow(w)
 		if err != nil {
-			log.Error(err, fmt.Sprintf("Error getting start and end times from DisruptionWindow %s", w.Name))
+			log.Error(err, "Skipping invalid DisruptionWindow", "window", w.Name)
 			continue
 		}
-		inWindow = inWindow || inCurrentWindow
+		parsed = append(parsed, p)
 	}
 
-	next, ok := nextWindowTransition(nowUTC, windows, inWindow)
+	inWindow := inAnyWindow(nowUTC, parsed)
+	next, ok := nextWindowTransition(nowUTC, parsed, inWindow)
 	if !ok {
 		return inWindow, 0
 	}
 	return inWindow, max(next.Sub(nowUTC), time.Nanosecond)
 }
 
-// windowContains returns true if nowUTC is within the DisruptionWindow.
-func windowContains(nowUTC time.Time, w workloadsv1alpha1.DisruptionWindow) (bool, error) {
-	start, end, timeZone, err := windowInfo(nowUTC, w)
-	if err != nil {
-		return false, err
-	}
-
-	localNow := nowUTC.In(timeZone)
-	todayActive := len(w.DaysOfWeek) == 0 || slices.Contains(w.DaysOfWeek, localNow.Weekday().String())
-	yesterdayActive := len(w.DaysOfWeek) == 0 || slices.Contains(w.DaysOfWeek, localNow.AddDate(0, 0, -1).Weekday().String())
-	if !todayActive && !yesterdayActive {
-		return false, nil
-	}
-
-	return evaluateWindow(start, end, nowUTC, todayActive, yesterdayActive), nil
+// timeOfDay is a wall-clock time with minute precision.
+type timeOfDay struct {
+	hour, minute int
 }
 
-// inAnyWindow returns true if nowUTC is within any valid DisruptionWindow.
-func inAnyWindow(nowUTC time.Time, windows []workloadsv1alpha1.DisruptionWindow) bool {
-	for _, w := range windows {
-		if in, err := windowContains(nowUTC, w); err == nil && in {
-			return true
-		}
-	}
-	return false
+// before returns true if t is earlier in the day than other.
+func (t timeOfDay) before(other timeOfDay) bool {
+	return t.hour*60+t.minute < other.hour*60+other.minute
 }
 
-// nextWindowTransition returns the earliest time, not before nowUTC, at which inAnyWindow changes from inWindow.
-// It returns false if inAnyWindow does not change within windowTransitionSearchDays, e.g. because no window is valid
-// or the windows cover every day of the week.
-//
-// Whether a time is within a window can only change at the window's start or end time, or at midnight (when the day
-// of the week changes) in the window's time zone, so only those candidate times are evaluated. Windows exclude their
-// start time, so each candidate is evaluated just after it.
-func nextWindowTransition(nowUTC time.Time, windows []workloadsv1alpha1.DisruptionWindow, inWindow bool) (time.Time, bool) {
-	candidates := make([]time.Time, 0, len(windows)*3*(windowTransitionSearchDays+1))
-	for _, w := range windows {
-		candidates = append(candidates, windowBoundaries(nowUTC, w)...)
-	}
-	slices.SortFunc(candidates, time.Time.Compare)
-
-	for _, candidate := range candidates {
-		if candidate.Before(nowUTC) {
-			continue
-		}
-		if inAnyWindow(candidate.Add(time.Nanosecond), windows) != inWindow {
-			return candidate, true
-		}
-	}
-	return time.Time{}, false
-}
-
-// windowBoundaries returns the times, from the start of the current day in the window's time zone through the next
-// windowTransitionSearchDays days, at which the window starts or ends, or the day of the week changes.
-// It returns nil if the window is invalid.
-func windowBoundaries(nowUTC time.Time, w workloadsv1alpha1.DisruptionWindow) []time.Time {
-	timeZone, start, end, err := parseWindow(w)
-	if err != nil {
-		return nil
-	}
-
-	localNow := nowUTC.In(timeZone)
-	boundaries := make([]time.Time, 0, 3*(windowTransitionSearchDays+1))
-	for days := 0; days <= windowTransitionSearchDays; days++ {
-		day := time.Date(localNow.Year(), localNow.Month(), localNow.Day()+days, 0, 0, 0, 0, timeZone)
-		boundaries = append(boundaries, day, atTimeOfDay(day, start), atTimeOfDay(day, end))
-	}
-	return boundaries
-}
-
-// windowInfo calculates the DisruptionWindow's start and end times in UTC for the current local day.
-// It anchors the window's time to the date in the specified TimeZone before converting back to UTC.
-// On error, it returns (nowUTC, nowUTC, nil, err).
-func windowInfo(nowUTC time.Time, w workloadsv1alpha1.DisruptionWindow) (start, end time.Time, timeZone *time.Location, err error) {
-	timeZone, startTime, endTime, err := parseWindow(w)
-	if err != nil {
-		return nowUTC, nowUTC, nil, err
-	}
-
-	localTime := nowUTC.In(timeZone)
-	startUTC := atTimeOfDay(localTime, startTime).UTC()
-	endUTC := atTimeOfDay(localTime, endTime).UTC()
-
-	return startUTC, endUTC, timeZone, nil
+// parsedWindow is a DisruptionWindow whose time zone and times have been parsed.
+type parsedWindow struct {
+	daysOfWeek []string // Empty means every day of the week.
+	location   *time.Location
+	start, end timeOfDay
 }
 
 // parseWindow parses the DisruptionWindow's time zone (UTC if unset), and its start and end times of day.
-func parseWindow(w workloadsv1alpha1.DisruptionWindow) (timeZone *time.Location, start, end time.Time, err error) {
+func parseWindow(w workloadsv1alpha1.DisruptionWindow) (parsedWindow, error) {
+	var err error
 	location := "Etc/UTC"
 	if w.TimeZone != "" {
 		location = w.TimeZone
 	}
-
 	if isLocalTimeZone(location) {
 		err = errors.Join(err, fmt.Errorf("`timeZone` must not be %s, got '%s'", QuotedList([]string{"Local", "local"}), w.TimeZone))
 	}
-
-	var timeZoneErr error
-	timeZone, timeZoneErr = time.LoadLocation(location)
+	timeZone, timeZoneErr := time.LoadLocation(location)
 	if timeZoneErr != nil {
 		err = errors.Join(err, timeZoneErr)
 	}
@@ -209,43 +144,157 @@ func parseWindow(w workloadsv1alpha1.DisruptionWindow) (timeZone *time.Location,
 	if startErr != nil {
 		err = errors.Join(err, startErr)
 	}
-
 	end, endErr := time.Parse(hoursMinutesOnly, w.EndTime)
 	if endErr != nil {
 		err = errors.Join(err, endErr)
 	}
-
-	return timeZone, start, end, err
-}
-
-// atTimeOfDay returns the time on day's date, in day's location, with the hour and minute of timeOfDay.
-func atTimeOfDay(day, timeOfDay time.Time) time.Time {
-	return time.Date(day.Year(), day.Month(), day.Day(), timeOfDay.Hour(), timeOfDay.Minute(), 0, 0, day.Location())
-}
-
-func evaluateWindow(start, end, nowUTC time.Time, todayActive, yesterdayActive bool) bool {
-	// Handle windows that wrap around midnight (e.g. 22:00 to 04:00)
-	if end.Before(start) {
-		return evaluateCrossMidnightWindow(start, end, nowUTC, todayActive, yesterdayActive)
+	if err != nil {
+		return parsedWindow{}, err
 	}
 
-	if !todayActive {
+	return parsedWindow{
+		daysOfWeek: w.DaysOfWeek,
+		location:   timeZone,
+		start:      timeOfDay{start.Hour(), start.Minute()},
+		end:        timeOfDay{end.Hour(), end.Minute()},
+	}, nil
+}
+
+// activeOn returns true if the window starts on the given calendar date in its time zone.
+func (w parsedWindow) activeOn(year int, month time.Month, day int) bool {
+	if len(w.daysOfWeek) == 0 {
+		return true
+	}
+	// Civil arithmetic in UTC normalizes day overflow and underflow without time zone effects.
+	weekday := time.Date(year, month, day, 12, 0, 0, 0, time.UTC).Weekday()
+	return slices.Contains(w.daysOfWeek, weekday.String())
+}
+
+// contains returns true if t is within the window.
+//
+// DaysOfWeek refers to the window's start day in its time zone. For a window that wraps around midnight
+// (e.g. 22:00 to 04:00), [start, 24:00) is active when today is in DaysOfWeek, and [00:00, end) is the spillover from
+// yesterday night's window, so it is active when yesterday was in DaysOfWeek. A window whose start equals its end
+// covers the whole day.
+func (w parsedWindow) contains(t time.Time) bool {
+	local := t.In(w.location)
+	year, month, day := local.Date()
+	todayActive := w.activeOn(year, month, day)
+	yesterdayActive := w.activeOn(year, month, day-1)
+	if !todayActive && !yesterdayActive {
 		return false
 	}
 
-	return evaluateSameDayWindow(start, end, nowUTC)
+	start := localTime(year, month, day, w.start, w.location)
+	end := localTime(year, month, day, w.end, w.location)
+	switch {
+	case w.start == w.end:
+		return todayActive
+	case w.end.before(w.start):
+		return (todayActive && !t.Before(start)) || (yesterdayActive && t.Before(end))
+	default:
+		return todayActive && !t.Before(start) && t.Before(end)
+	}
 }
 
-func evaluateCrossMidnightWindow(start, end, now time.Time, todayActive, yesterdayActive bool) bool {
-	// DaysOfWeek refers to the window's start day in its local timezone:
-	// - [start, 24:00) is active when today is in DaysOfWeek.
-	// - [00:00, end) is the spillover from yesterday night's window, so it is active when yesterday was in DaysOfWeek.
-	return (todayActive && now.After(start)) || (yesterdayActive && now.Before(end))
+// boundaries returns the instants, from the start of the current calendar day in the window's time zone through the
+// next windowTransitionSearchDays days, at which the window starts or ends, or the calendar day changes.
+func (w parsedWindow) boundaries(nowUTC time.Time) []time.Time {
+	year, month, day := nowUTC.In(w.location).Date()
+	midnight := timeOfDay{}
+	boundaries := make([]time.Time, 0, 3*(windowTransitionSearchDays+1))
+	for days := 0; days <= windowTransitionSearchDays; days++ {
+		boundaries = append(boundaries,
+			localTime(year, month, day+days, midnight, w.location),
+			localTime(year, month, day+days, w.start, w.location),
+			localTime(year, month, day+days, w.end, w.location),
+		)
+	}
+	return boundaries
 }
 
-func evaluateSameDayWindow(start, end, now time.Time) bool {
-	strictlyBetween := now.After(start) && now.Before(end)
-	startEqualsEnd := start.Compare(end) == 0
+// inAnyWindow returns true if t is within any of the windows.
+func inAnyWindow(t time.Time, windows []parsedWindow) bool {
+	for _, w := range windows {
+		if w.contains(t) {
+			return true
+		}
+	}
+	return false
+}
 
-	return strictlyBetween || startEqualsEnd
+// nextWindowTransition returns the earliest instant, not before nowUTC, at which inAnyWindow changes from inWindow.
+// It returns false if inAnyWindow does not change within windowTransitionSearchDays, e.g. because there are no valid
+// windows or the windows cover every day of the week.
+//
+// Whether an instant is within a window can only change when the window starts or ends, or when the calendar day
+// changes in the window's time zone, so only those candidate instants are evaluated. Windows include their start and
+// exclude their end, so each candidate is evaluated just after it, which is the state that holds from the candidate on.
+func nextWindowTransition(nowUTC time.Time, windows []parsedWindow, inWindow bool) (time.Time, bool) {
+	candidates := make([]time.Time, 0, len(windows)*3*(windowTransitionSearchDays+1))
+	for _, w := range windows {
+		candidates = append(candidates, w.boundaries(nowUTC)...)
+	}
+	slices.SortFunc(candidates, time.Time.Compare)
+	candidates = slices.CompactFunc(candidates, time.Time.Equal)
+
+	for _, candidate := range candidates {
+		if candidate.Before(nowUTC) {
+			continue
+		}
+		if inAnyWindow(candidate.Add(time.Nanosecond), windows) != inWindow {
+			return candidate, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// localTime returns the instant at which the wall-clock time tod occurs on the calendar date (year, month, day) in
+// loc. The day may be outside the month's range and is normalized like time.Date.
+//
+// Unlike time.Date, the result is well defined across daylight saving time changes: if the wall-clock time occurs
+// twice because clocks are turned back, the first occurrence is returned; if it does not occur because clocks are
+// turned forward past it, the instant of the change is returned. In particular, localTime with a midnight tod is the
+// first instant of the calendar day even in time zones that change clocks at midnight.
+func localTime(year int, month time.Month, day int, tod timeOfDay, loc *time.Location) time.Time {
+	// civil is the wall-clock time as if it were UTC. Subtracting a zone offset from it yields the instant at which
+	// that wall-clock time is shown in a zone with that offset.
+	civil := time.Date(year, month, day, tod.hour, tod.minute, 0, 0, time.UTC)
+	guess := time.Date(year, month, day, tod.hour, tod.minute, 0, 0, loc)
+	_, offsetBefore := guess.Add(-24 * time.Hour).Zone()
+	_, offsetGuess := guess.Zone()
+	_, offsetAfter := guess.Add(24 * time.Hour).Zone()
+
+	var earliest time.Time
+	for _, offset := range []int{offsetBefore, offsetGuess, offsetAfter} {
+		instant := civil.Add(-time.Duration(offset) * time.Second)
+		if showsWallClock(instant, loc, civil) && (earliest.IsZero() || instant.Before(earliest)) {
+			earliest = instant
+		}
+	}
+	if !earliest.IsZero() {
+		return earliest
+	}
+
+	// The wall-clock time falls in a gap: clocks were turned forward past it. Find the instant of the change by
+	// binary search between the instants the time would have in the zone before and after the change.
+	lo := civil.Add(-time.Duration(max(offsetBefore, offsetAfter)) * time.Second).In(loc)
+	hi := civil.Add(-time.Duration(min(offsetBefore, offsetAfter)) * time.Second).In(loc)
+	_, loOffset := lo.Zone()
+	for hi.Sub(lo) > time.Second {
+		mid := lo.Add((hi.Sub(lo) / 2).Truncate(time.Second))
+		if _, offset := mid.Zone(); offset == loOffset {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return hi.UTC()
+}
+
+// showsWallClock returns true if instant, shown in loc, has the calendar date, hour, and minute of civil.
+func showsWallClock(instant time.Time, loc *time.Location, civil time.Time) bool {
+	local := instant.In(loc)
+	return local.Year() == civil.Year() && local.Month() == civil.Month() && local.Day() == civil.Day() &&
+		local.Hour() == civil.Hour() && local.Minute() == civil.Minute()
 }

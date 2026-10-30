@@ -38,21 +38,30 @@ type DisruptionPolicy struct {
 	// +optional
 	AllowedDisruptionsOutsideOfWindow []Subject `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
 
-	// MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
-	// If exceeded, maintenance takes precedence over per-pod run-duration hints.
+	// MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted, counted from
+	// status.lastDisruptionTime, or from the creation of the WorkloadClass if no disruption has been observed yet.
+	// Once reached, the WorkloadClass is Overdue for maintenance: maintenance takes precedence over
+	// allowedDisruptionWindows and over per-pod run-duration hints.
 	// When unset (0), no upper bound is placed on how long the workload can remain undisrupted.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=36500
 	MaxNonDisruptionDurationDays int32 `json:"maxNonDisruptionDurationDays,omitempty"`
 
-	// MinInitialRunDurationDays is the minimum duration a pod must run before it can be disrupted.
+	// MinInitialRunDurationDays is the minimum duration a pod must run before it can be disrupted. It is counted from
+	// the pod's status.startTime, or from its creationTimestamp until the pod has been acknowledged by a kubelet.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=36500
 	MinInitialRunDurationDays int32 `json:"minInitialRunDurationDays,omitempty"`
 
-	// GraceTerminationDurationSeconds is the duration in seconds after a pod's deletionTimestamp is set during which
-	// the controller keeps the WorkloadClass MaintenanceReadiness as NotReady to allow in-flight pod terminations to drain
-	// before further disruptions occur. It does not override Pod.spec.terminationGracePeriodSeconds or set eviction DeleteOptions.gracePeriodSeconds.
+	// GraceTerminationDurationSeconds is the duration in seconds after a pod starts terminating during which the
+	// controller keeps the WorkloadClass MaintenanceReadiness as NotReady to allow in-flight pod terminations to drain
+	// before further disruptions occur. A pod starts terminating when its deletion is requested, which is its
+	// deletionTimestamp minus its deletionGracePeriodSeconds; the controller records the most recent such time in
+	// status.lastPodTerminationTime so that the duration is honored after the pod is gone. Pods that are deleted
+	// before the controller observes them terminating, such as pods deleted with a grace period of 0, are not counted.
+	// It does not override Pod.spec.terminationGracePeriodSeconds or set eviction DeleteOptions.gracePeriodSeconds.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	GraceTerminationDurationSeconds int32 `json:"graceTerminationDurationSeconds,omitempty"`
@@ -141,11 +150,11 @@ const (
 	// ReadinessNotReady indicates that maintenance must wait: the current time is outside of every allowed disruption
 	// window, or a selected pod is protected by MinInitialRunDurationDays or GraceTerminationDurationSeconds.
 	ReadinessNotReady MaintenanceReadiness = "NotReady"
-	// ReadinessOverdue indicates that the workload has remained undisrupted for longer than MaxNonDisruptionDurationDays,
+	// ReadinessOverdue indicates that the workload has remained undisrupted for at least MaxNonDisruptionDurationDays,
 	// so maintenance takes precedence over disruption windows and per-pod run-duration hints.
 	ReadinessOverdue MaintenanceReadiness = "Overdue"
-	// ReadinessUnknown indicates that readiness cannot be determined, for example because the WorkloadClass failed
-	// validation.
+	// ReadinessUnknown indicates that readiness cannot be determined, because the WorkloadClass is not validated or
+	// because of an error.
 	ReadinessUnknown MaintenanceReadiness = "Unknown"
 )
 
@@ -169,13 +178,14 @@ const (
 
 	// ConditionTypeMaintenanceAllowed indicates whether maintenance can currently disrupt the pods selected by the
 	// WorkloadClass. It is True when MaintenanceReadiness is Ready or Overdue, False when it is NotReady, and Unknown
-	// when it is Unknown. If the WorkloadClass failed validation, its Reason is ReasonValidationFailed.
+	// when it is Unknown. If the WorkloadClass is not validated, its Reason is the Reason of the Validated condition
+	// (ReasonValidationFailed or ReasonSelectorOverlap).
 	ConditionTypeMaintenanceAllowed = "MaintenanceAllowed"
 
 	// ReasonEmergencyOverride indicates that maintenance is allowed because EmergencyOverride is set.
 	ReasonEmergencyOverride = "EmergencyOverride"
 	// ReasonMaintenanceOverdue indicates that maintenance is allowed because the workload has remained undisrupted for
-	// longer than MaxNonDisruptionDurationDays.
+	// at least MaxNonDisruptionDurationDays.
 	ReasonMaintenanceOverdue = "MaintenanceOverdue"
 	// ReasonWithinDisruptionWindow indicates that maintenance is allowed because the current time is within an allowed
 	// disruption window (or no windows are defined) and no selected pod is protected.
@@ -184,10 +194,11 @@ const (
 	// every allowed disruption window.
 	ReasonOutsideDisruptionWindow = "OutsideDisruptionWindow"
 	// ReasonMinInitialRunDurationNotMet indicates that maintenance is not allowed because a selected pod has not yet run
-	// for MinInitialRunDurationDays.
+	// for MinInitialRunDurationDays, counted from its status.startTime, or from its creationTimestamp until it has been
+	// acknowledged by a kubelet.
 	ReasonMinInitialRunDurationNotMet = "MinInitialRunDurationNotMet"
 	// ReasonGraceTerminationInProgress indicates that maintenance is not allowed because a selected pod started
-	// terminating less than GraceTerminationDurationSeconds ago.
+	// terminating less than GraceTerminationDurationSeconds ago (see status.lastPodTerminationTime).
 	ReasonGraceTerminationInProgress = "GraceTerminationInProgress"
 	// ReasonReadinessCheckFailed indicates that maintenance readiness could not be determined because of an error.
 	ReasonReadinessCheckFailed = "ReadinessCheckFailed"
@@ -202,6 +213,12 @@ type WorkloadClassStatus struct {
 	// LastDisruptionTime is the last time a disruption was observed for pods in this class.
 	// +optional
 	LastDisruptionTime *metav1.Time `json:"lastDisruptionTime,omitempty"`
+
+	// LastPodTerminationTime is the most recent time a pod selected by this class was observed to start terminating,
+	// that is, the time its deletion was requested. The controller keeps MaintenanceReadiness as NotReady until
+	// GraceTerminationDurationSeconds have passed since this time, even if the pod no longer exists.
+	// +optional
+	LastPodTerminationTime *metav1.Time `json:"lastPodTerminationTime,omitempty"`
 
 	// Conditions represent the current state of the WorkloadClass resource.
 	// +listType=map
