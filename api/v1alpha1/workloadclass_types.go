@@ -129,12 +129,24 @@ type WorkloadClassSpec struct {
 	DisruptionPolicy DisruptionPolicy `json:"disruptionPolicy,omitempty"`
 }
 
+// MaintenanceReadiness indicates whether the pods selected by a WorkloadClass can currently be disrupted for maintenance.
+// +kubebuilder:validation:Enum=Ready;NotReady;Overdue;Unknown
 type MaintenanceReadiness string
 
 const (
-	ReadinessReady    MaintenanceReadiness = "Ready"
+	// ReadinessReady indicates that maintenance can proceed: the current time is within an allowed disruption window
+	// and no selected pod is protected by MinInitialRunDurationDays or GraceTerminationDurationSeconds, or
+	// EmergencyOverride is set.
+	ReadinessReady MaintenanceReadiness = "Ready"
+	// ReadinessNotReady indicates that maintenance must wait: the current time is outside of every allowed disruption
+	// window, or a selected pod is protected by MinInitialRunDurationDays or GraceTerminationDurationSeconds.
 	ReadinessNotReady MaintenanceReadiness = "NotReady"
-	ReadinessOverdue  MaintenanceReadiness = "Overdue"
+	// ReadinessOverdue indicates that the workload has remained undisrupted for longer than MaxNonDisruptionDurationDays,
+	// so maintenance takes precedence over disruption windows and per-pod run-duration hints.
+	ReadinessOverdue MaintenanceReadiness = "Overdue"
+	// ReadinessUnknown indicates that readiness cannot be determined, for example because the WorkloadClass failed
+	// validation.
+	ReadinessUnknown MaintenanceReadiness = "Unknown"
 )
 
 const (
@@ -154,6 +166,31 @@ const (
 	ReasonNoGuardrails = "NoGuardrails"
 	// ReasonSelectorOverlap indicates that the WorkloadClass PodSelector overlaps with another WorkloadClass in the same namespace.
 	ReasonSelectorOverlap = "SelectorOverlap"
+
+	// ConditionTypeMaintenanceAllowed indicates whether maintenance can currently disrupt the pods selected by the
+	// WorkloadClass. It is True when MaintenanceReadiness is Ready or Overdue, False when it is NotReady, and Unknown
+	// when it is Unknown. If the WorkloadClass failed validation, its Reason is ReasonValidationFailed.
+	ConditionTypeMaintenanceAllowed = "MaintenanceAllowed"
+
+	// ReasonEmergencyOverride indicates that maintenance is allowed because EmergencyOverride is set.
+	ReasonEmergencyOverride = "EmergencyOverride"
+	// ReasonMaintenanceOverdue indicates that maintenance is allowed because the workload has remained undisrupted for
+	// longer than MaxNonDisruptionDurationDays.
+	ReasonMaintenanceOverdue = "MaintenanceOverdue"
+	// ReasonWithinDisruptionWindow indicates that maintenance is allowed because the current time is within an allowed
+	// disruption window (or no windows are defined) and no selected pod is protected.
+	ReasonWithinDisruptionWindow = "WithinDisruptionWindow"
+	// ReasonOutsideDisruptionWindow indicates that maintenance is not allowed because the current time is outside of
+	// every allowed disruption window.
+	ReasonOutsideDisruptionWindow = "OutsideDisruptionWindow"
+	// ReasonMinInitialRunDurationNotMet indicates that maintenance is not allowed because a selected pod has not yet run
+	// for MinInitialRunDurationDays.
+	ReasonMinInitialRunDurationNotMet = "MinInitialRunDurationNotMet"
+	// ReasonGraceTerminationInProgress indicates that maintenance is not allowed because a selected pod started
+	// terminating less than GraceTerminationDurationSeconds ago.
+	ReasonGraceTerminationInProgress = "GraceTerminationInProgress"
+	// ReasonReadinessCheckFailed indicates that maintenance readiness could not be determined because of an error.
+	ReasonReadinessCheckFailed = "ReadinessCheckFailed"
 )
 
 // WorkloadClassStatus defines the observed state of WorkloadClass.
