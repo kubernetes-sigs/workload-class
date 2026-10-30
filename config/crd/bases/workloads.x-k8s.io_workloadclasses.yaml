@@ -277,6 +277,11 @@ spec:
               maintenanceReadiness:
                 description: MaintenanceReadiness indicates if the workload is currently
                   ready for maintenance.
+                enum:
+                - Ready
+                - NotReady
+                - Overdue
+                - Unknown
                 type: string
             type: object
         required:
