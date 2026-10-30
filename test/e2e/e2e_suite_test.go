@@ -40,6 +40,12 @@ var (
 	namespace = "workload-class-system"
 )
 
+func init() {
+	if v, ok := os.LookupEnv("IMG"); ok && v != "" {
+		managerImage = v
+	}
+}
+
 // TestE2E runs the e2e test suite against an isolated Kind cluster.
 // The default setup requires Kind and cert-manager (used to issue the webhook serving certificate).
 //

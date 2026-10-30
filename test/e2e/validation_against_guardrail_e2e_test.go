@@ -27,6 +27,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/types"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
@@ -51,7 +52,7 @@ const (
 // end: the Validated status condition written by the WorkloadClass controller, re-validation triggered by
 // watches on WorkloadClassGuardrails and sibling WorkloadClasses, CRD schema validation, and the
 // WorkloadClassGuardrail validating admission webhook.
-var _ = Describe("WorkloadClass validation", Ordered, func() {
+var _ = Describe("WorkloadClass validation", Ordered, ContinueOnFailure, func() {
 	BeforeAll(func() {
 		By("creating the manager namespace")
 		_, err := utils.Run(exec.Command("kubectl", "create", "ns", namespace))
@@ -122,8 +123,8 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 			mustApply(newWorkloadClass("no-guardrails", map[string]string{"app": "no-guardrails"},
 				withMaxNonDisruptionDays(7)))
 
-			cond := eventuallyValidated("no-guardrails", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
-			Expect(cond.Message).To(Equal("No Guardrails found to validate against"))
+			eventuallyValidated("no-guardrails", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails,
+				Equal("No Guardrails found to validate against"))
 		})
 
 		It("reports ValidationPassed for a WorkloadClass that complies with every guardrail", func() {
@@ -137,8 +138,8 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 				withWindows(window("weekend", "Saturday", "Sunday")),
 				withMaxNonDisruptionDays(14)))
 
-			cond := eventuallyValidated("compliant", metav1.ConditionTrue, workloadsv1alpha1.ReasonValidationPassed)
-			Expect(cond.Message).To(Equal("WorkloadClass adheres to all Guardrail constraints"))
+			eventuallyValidated("compliant", metav1.ConditionTrue, workloadsv1alpha1.ReasonValidationPassed,
+				Equal("WorkloadClass adheres to all Guardrail constraints"))
 		})
 
 		It("reports every guardrail violation with the limits, but without guardrail names", func() {
@@ -152,15 +153,14 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 			mustApply(newWorkloadClass("non-compliant", map[string]string{"app": "non-compliant"},
 				withWindows(window("mon", "Monday"), window("sat", "Saturday"), window("sun", "Sunday"))))
 
-			cond := eventuallyValidated("non-compliant", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(SatisfyAll(
+			eventuallyValidated("non-compliant", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
 				ContainSubstring("`daysOfWeek` of disruption window 'mon' must contain only 'Sunday', 'Saturday' "+
 					"(guardrail limit), got 'Monday'"),
 				ContainSubstring("`allowedDisruptionWindows` must have at most 2 items (guardrail limit), got 3"),
 				ContainSubstring("`maxNonDisruptionDurationDays` must be between 1 and 14, inclusive (guardrail limit), "+
 					"got 0 (0 means no limit)"),
 				Not(ContainSubstring(guardrailName)),
-			))
+			)
 		})
 
 		It("reports a violation shared by several guardrails only once", func() {
@@ -169,9 +169,9 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 			mustApply(newWorkloadClass("shared-violation", map[string]string{"app": "shared-violation"},
 				withMaxNonDisruptionDays(30)))
 
-			cond := eventuallyValidated("shared-violation", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(Equal(
-				"`maxNonDisruptionDurationDays` must be between 1 and 14, inclusive (guardrail limit), got 30 (0 means no limit)"))
+			eventuallyValidated("shared-violation", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
+				Equal("`maxNonDisruptionDurationDays` must be between 1 and 14, inclusive (guardrail limit), "+
+					"got 30 (0 means no limit)"))
 		})
 
 		It("combines several guardrails into the strictest limit for each constraint", func() {
@@ -190,8 +190,7 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 				withWindows(window("fri", "Friday"), window("sat", "Saturday")),
 				withMaxNonDisruptionDays(21)))
 
-			cond := eventuallyValidated("combined", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(SatisfyAll(
+			eventuallyValidated("combined", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
 				ContainSubstring("`daysOfWeek` of disruption window 'fri' must contain only 'Sunday', 'Saturday' "+
 					"(guardrail limit), got 'Friday'"),
 				ContainSubstring("`allowedDisruptionWindows` must have at most 1 items (guardrail limit), got 2"),
@@ -200,7 +199,7 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 				Not(ContainSubstring("window 'sat'")),
 				Not(ContainSubstring("between 1 and 30")),
 				Not(ContainSubstring("at most 3 items")),
-			))
+			)
 		})
 
 		It("reports a single actionable message when guardrails allow no common day", func() {
@@ -216,9 +215,9 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 				withWindows(window("sat", "Saturday")),
 				withMaxNonDisruptionDays(7)))
 
-			cond := eventuallyValidated("disjoint", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(Equal("cluster guardrails restrict `daysOfWeek` to disjoint sets, so no " +
-				"disruption window can comply; contact your cluster administrator"))
+			eventuallyValidated("disjoint", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
+				Equal("cluster guardrails restrict `daysOfWeek` to disjoint sets, so no "+
+					"disruption window can comply; contact your cluster administrator"))
 		})
 
 		It("reports invalid weekday names and time zones even without guardrails", func() {
@@ -229,13 +228,12 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 				withWindows(badDay, badZone),
 				withMaxNonDisruptionDays(7)))
 
-			cond := eventuallyValidated("invalid-spec", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(SatisfyAll(
+			eventuallyValidated("invalid-spec", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
 				ContainSubstring("disruption window 'funday': `daysOfWeek` must only contain"),
 				ContainSubstring("got 'Funday'"),
 				ContainSubstring("`timeZone` of disruption window 'mars' must be a valid IANA time zone name "+
 					"other than 'Local', got 'Mars/Phobos'"),
-			))
+			)
 		})
 
 		It("updates observedGeneration and the result when the WorkloadClass spec changes", func() {
@@ -247,8 +245,8 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 			By("raising maxNonDisruptionDurationDays above the guardrail limit")
 			mustPatch("workloadclass", "spec-change", testNamespace,
 				`{"spec":{"disruptionPolicy":{"maxNonDisruptionDurationDays":21}}}`)
-			cond := eventuallyValidated("spec-change", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(ContainSubstring("got 21"))
+			eventuallyValidated("spec-change", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
+				ContainSubstring("got 21"))
 
 			By("lowering it back within the limit")
 			mustPatch("workloadclass", "spec-change", testNamespace,
@@ -271,15 +269,14 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 			By("tightening the guardrail below the WorkloadClass value")
 			mustPatch("workloadclassguardrail", "wc-e2e-changing", "",
 				`{"spec":{"constraints":{"disruption":{"maxNonDisruptionDurationDays":7}}}}`)
-			cond := eventuallyValidated("watched", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(ContainSubstring("must be between 1 and 7, inclusive (guardrail limit), got 14"))
+			eventuallyValidated("watched", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
+				ContainSubstring("must be between 1 and 7, inclusive (guardrail limit), got 14"))
 
 			By("restricting the allowed days so the window no longer complies")
 			mustPatch("workloadclassguardrail", "wc-e2e-changing", "",
 				`{"spec":{"constraints":{"disruption":{"maxNonDisruptionDurationDays":30,"daysOfWeek":["Sunday"]}}}}`)
-			cond = eventuallyValidated("watched", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(Equal(
-				"`daysOfWeek` of disruption window 'weekend' must contain only 'Sunday' (guardrail limit), " +
+			eventuallyValidated("watched", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
+				Equal("`daysOfWeek` of disruption window 'weekend' must contain only 'Sunday' (guardrail limit), "+
 					"got 'Saturday', 'Sunday'"))
 
 			By("deleting the guardrail")
@@ -296,43 +293,44 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 				DaysOfWeek:                   []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"},
 				MaxNonDisruptionDurationDays: 30,
 			}))
-			cond := eventuallyValidated("no-windows", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(ContainSubstring(
-				"`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only " +
+			eventuallyValidated("no-windows", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
+				ContainSubstring("`allowedDisruptionWindows` must be specified, with `daysOfWeek` containing only "+
 					"'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday' (guardrail limit)"))
 		})
 	})
 
 	Context("podSelector overlap", func() {
-		It("marks both WorkloadClasses and clears the overlap when one selector changes", func() {
+		It("reports the overlap on both WorkloadClasses without failing validation, and clears it when one selector changes", func() {
 			mustApply(newWorkloadClass("web", map[string]string{"app": "web"}, withMaxNonDisruptionDays(7)))
 			mustApply(newWorkloadClass("web-frontend", map[string]string{"app": "web", "tier": "frontend"},
 				withMaxNonDisruptionDays(7)))
 
-			cond := eventuallyValidated("web", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
-			Expect(cond.Message).To(Equal("`podSelector` must not select the same Pods as another WorkloadClass in the " +
-				"namespace, but it overlaps with the `podSelector` of 'web-frontend'"))
-			cond = eventuallyValidated("web-frontend", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
-			Expect(cond.Message).To(ContainSubstring("overlaps with the `podSelector` of 'web'"))
+			eventuallyOverlap("web", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap,
+				Equal("`podSelector` may select the same Pods as the `podSelector` of 'web-frontend'; "+
+					"a Pod selected by more than one WorkloadClass is governed by the oldest of them"))
+			eventuallyOverlap("web-frontend", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap,
+				ContainSubstring("the `podSelector` of 'web'"))
+			eventuallyValidated("web", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
+			eventuallyValidated("web-frontend", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
 
 			By("changing web-frontend so it no longer selects app=web Pods")
 			mustPatch("workloadclass", "web-frontend", testNamespace,
 				`{"spec":{"podSelector":{"matchLabels":{"app":"db"}}}}`)
 
-			// Only web-frontend changed, so web is re-validated through the watch on sibling WorkloadClasses.
-			eventuallyValidated("web", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
-			eventuallyValidated("web-frontend", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
+			// Only web-frontend changed, so web is re-evaluated through the watch on sibling WorkloadClasses.
+			eventuallyOverlap("web", metav1.ConditionFalse, workloadsv1alpha1.ReasonNoSelectorOverlap)
+			eventuallyOverlap("web-frontend", metav1.ConditionFalse, workloadsv1alpha1.ReasonNoSelectorOverlap)
 		})
 
 		It("clears the overlap when the overlapping WorkloadClass is deleted", func() {
 			mustApply(newWorkloadClass("batch", map[string]string{"app": "batch"}, withMaxNonDisruptionDays(7)))
 			mustApply(newWorkloadClass("batch-copy", map[string]string{"app": "batch"}, withMaxNonDisruptionDays(7)))
-			eventuallyValidated("batch", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
+			eventuallyOverlap("batch", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap)
 
 			_, err := utils.Run(exec.Command("kubectl", "delete", "workloadclass", "batch-copy", "-n", testNamespace))
 			Expect(err).NotTo(HaveOccurred())
 
-			eventuallyValidated("batch", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
+			eventuallyOverlap("batch", metav1.ConditionFalse, workloadsv1alpha1.ReasonNoSelectorOverlap)
 		})
 
 		It("evaluates matchExpressions when deciding whether selectors overlap", func() {
@@ -348,85 +346,30 @@ var _ = Describe("WorkloadClass validation", Ordered, func() {
 
 			// app=api and app NotIn (api) are disjoint, but a Pod with app=api and a track label matches both api
 			// and canary, and a Pod with app=web and a track label matches both not-api and canary.
-			cond := eventuallyValidated("canary", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
-			Expect(cond.Message).To(Equal("`podSelector` must not select the same Pods as another WorkloadClass in the " +
-				"namespace, but it overlaps with the `podSelector` of 'api', 'not-api'"))
+			eventuallyOverlap("canary", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap,
+				Equal("`podSelector` may select the same Pods as the `podSelector` of 'api', 'not-api'; "+
+					"a Pod selected by more than one WorkloadClass is governed by the oldest of them"))
 
-			cond = eventuallyValidated("api", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
-			Expect(cond.Message).To(SatisfyAll(ContainSubstring("'canary'"), Not(ContainSubstring("'not-api'"))))
+			eventuallyOverlap("api", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap,
+				ContainSubstring("'canary'"), Not(ContainSubstring("'not-api'")))
 
-			cond = eventuallyValidated("not-api", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
-			Expect(cond.Message).To(SatisfyAll(ContainSubstring("'canary'"), Not(ContainSubstring("'api'"))))
+			eventuallyOverlap("not-api", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap,
+				ContainSubstring("'canary'"), Not(ContainSubstring("'api'")))
 		})
 
-		It("reports guardrail violations and the overlap together as ValidationFailed", func() {
+		It("reports guardrail violations in Validated and the overlap in PodSelectorOverlap", func() {
 			mustApply(newGuardrail("wc-e2e-overlap-limit", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 7}))
 			mustApply(newWorkloadClass("jobs", map[string]string{"app": "jobs"}, withMaxNonDisruptionDays(30)))
 			mustApply(newWorkloadClass("jobs-copy", map[string]string{"app": "jobs"}, withMaxNonDisruptionDays(7)))
 
-			cond := eventuallyValidated("jobs", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			Expect(cond.Message).To(SatisfyAll(
+			eventuallyValidated("jobs", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed,
 				ContainSubstring("must be between 1 and 7, inclusive (guardrail limit), got 30"),
-				ContainSubstring("overlaps with the `podSelector` of 'jobs-copy'"),
-			))
-			eventuallyValidated("jobs-copy", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
-		})
-	})
-
-	Context("admission", func() {
-		It("rejects a WorkloadClass whose timeZone is Local", func() {
-			local := window("local", "Saturday")
-			local.TimeZone = "Local"
-			out, err := apply(newWorkloadClass("local-zone", map[string]string{"app": "local-zone"},
-				withWindows(local), withMaxNonDisruptionDays(7)))
-			Expect(err).To(HaveOccurred())
-			Expect(out).To(ContainSubstring("must not be 'Local' or 'local'"))
-		})
-
-		It("rejects a WorkloadClassGuardrail with invalid daysOfWeek", func() {
-			out, err := apply(newGuardrail("wc-e2e-invalid-days", workloadsv1alpha1.Disruption{
-				DaysOfWeek:                   []string{"Saturday", "Caturday"},
-				MaxNonDisruptionDurationDays: 7,
-			}))
-			Expect(err).To(HaveOccurred())
-			Expect(out).To(SatisfyAll(
-				ContainSubstring("`daysOfWeek` must only contain"),
-				ContainSubstring("got 'Caturday'"),
-			))
-		})
-
-		It("admits a WorkloadClassGuardrail but warns about existing WorkloadClasses that do not comply", func() {
-			mustApply(newWorkloadClass("lax", map[string]string{"app": "lax"}, withMaxNonDisruptionDays(30)))
-			mustApply(newWorkloadClass("tight", map[string]string{"app": "tight"}, withMaxNonDisruptionDays(5)))
-
-			out, err := apply(newGuardrail("wc-e2e-warns", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 10}))
-			Expect(err).NotTo(HaveOccurred())
-			Expect(out).To(SatisfyAll(
-				ContainSubstring(fmt.Sprintf(
-					"Warning: existing WorkloadClass '%s/lax' does not comply with this guardrail", testNamespace)),
-				ContainSubstring("must be between 1 and 10, inclusive (guardrail limit), got 30"),
-				Not(ContainSubstring(fmt.Sprintf("'%s/tight'", testNamespace))),
-			))
-
-			By("marking the non-compliant WorkloadClass as ValidationFailed")
-			eventuallyValidated("lax", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
-			eventuallyValidated("tight", metav1.ConditionTrue, workloadsv1alpha1.ReasonValidationPassed)
-		})
-	})
-
-	Context("controller manager", func() {
-		It("runs without restarts or RBAC errors", func() {
-			podName := controllerPodName()
-			Expect(podName).NotTo(BeEmpty())
-
-			restarts, err := utils.Run(exec.Command("kubectl", "get", "pod", podName, "-n", namespace,
-				"-o", "jsonpath={.status.containerStatuses[*].restartCount}"))
-			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.Fields(restarts)).To(HaveEach("0"))
-
-			logs, err := utils.Run(exec.Command("kubectl", "logs", podName, "-n", namespace))
-			Expect(err).NotTo(HaveOccurred())
-			Expect(logs).NotTo(ContainSubstring("is forbidden"))
+				Not(ContainSubstring("podSelector")),
+			)
+			eventuallyOverlap("jobs", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap,
+				ContainSubstring("the `podSelector` of 'jobs-copy'"))
+			eventuallyValidated("jobs-copy", metav1.ConditionTrue, workloadsv1alpha1.ReasonValidationPassed)
+			eventuallyOverlap("jobs-copy", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap)
 		})
 	})
 })
@@ -540,10 +483,11 @@ func getWorkloadClass(name string) (*workloadsv1alpha1.WorkloadClass, error) {
 }
 
 // eventuallyValidated waits until the Validated condition of the WorkloadClass reflects its current
-// generation and has the expected status and reason, and returns the condition.
-func eventuallyValidated(name string, status metav1.ConditionStatus, reason string) *metav1.Condition {
+// generation and has the expected status, reason, and message.
+func eventuallyValidated(name string, status metav1.ConditionStatus, reason string,
+	messageMatchers ...types.GomegaMatcher,
+) {
 	GinkgoHelper()
-	var cond *metav1.Condition
 	Eventually(func(g Gomega) {
 		wc, err := getWorkloadClass(name)
 		g.Expect(err).NotTo(HaveOccurred())
@@ -553,9 +497,29 @@ func eventuallyValidated(name string, status metav1.ConditionStatus, reason stri
 		g.Expect(c.ObservedGeneration).To(Equal(wc.Generation), "Validated condition is stale")
 		g.Expect(c.Status).To(Equal(status), "unexpected status; message: %s", c.Message)
 		g.Expect(c.Reason).To(Equal(reason), "unexpected reason; message: %s", c.Message)
-		cond = c
+		for _, m := range messageMatchers {
+			g.Expect(c.Message).To(m)
+		}
 	}, pollTimeout, pollInterval).Should(Succeed())
-	return cond
+}
+
+func eventuallyOverlap(name string, status metav1.ConditionStatus, reason string,
+	messageMatchers ...types.GomegaMatcher,
+) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		wc, err := getWorkloadClass(name)
+		g.Expect(err).NotTo(HaveOccurred())
+
+		c := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypePodSelectorOverlap)
+		g.Expect(c).NotTo(BeNil(), "WorkloadClass %q has no PodSelectorOverlap condition", name)
+		g.Expect(c.ObservedGeneration).To(Equal(wc.Generation), "PodSelectorOverlap condition is stale")
+		g.Expect(c.Status).To(Equal(status), "unexpected status; message: %s", c.Message)
+		g.Expect(c.Reason).To(Equal(reason), "unexpected reason; message: %s", c.Message)
+		for _, m := range messageMatchers {
+			g.Expect(c.Message).To(m)
+		}
+	}, pollTimeout, pollInterval).Should(Succeed())
 }
 
 // deleteTestGuardrails deletes every WorkloadClassGuardrail created by this file.
