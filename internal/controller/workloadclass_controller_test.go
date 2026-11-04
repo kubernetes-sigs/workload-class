@@ -755,6 +755,93 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Status().Patch(ctx, wc, patch)).To(Succeed())
 			eventuallyReadiness(workloadsv1alpha1.ReadinessReady)
 		})
+
+		It("should re-reconcile the namespace's WorkloadClasses when its enforced class is set, changed, or removed", func() {
+			const ns = "wc-enforced-class"
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.DeleteAllOf(ctx, &workloadsv1alpha1.WorkloadClass{}, client.InNamespace(ns))).To(Succeed())
+				deleteAllPods(ns)
+			})
+
+			for name, matchLabels := range map[string]map[string]string{
+				"wc-broad": {"app": "shared"},
+				"wc-web":   {"app": "shared", "tier": "web"},
+			} {
+				Expect(k8sClient.Create(ctx, &workloadsv1alpha1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+					Spec: workloadsv1alpha1.WorkloadClassSpec{
+						PodSelector: &metav1.LabelSelector{MatchLabels: matchLabels},
+						DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{
+							MaxNonDisruptionDurationDays: 7,
+							MinInitialRunDurationDays:    1,
+						},
+					},
+				})).To(Succeed())
+			}
+			// Neither Pod has run for MinInitialRunDurationDays, and no PodSelector selects young-other.
+			for name, podLabels := range map[string]map[string]string{
+				"young-web":   {"app": "shared", "tier": "web"},
+				"young-other": {"app": "other"},
+			} {
+				Expect(k8sClient.Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: podLabels},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+				})).To(Succeed())
+			}
+
+			eventuallyStatus := func(name, validated string, readiness workloadsv1alpha1.MaintenanceReadiness, msg string) {
+				GinkgoHelper()
+				Eventually(func(g Gomega) {
+					wc := &workloadsv1alpha1.WorkloadClass{}
+					g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, wc)).To(Succeed())
+					cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated)
+					g.Expect(cond).NotTo(BeNil())
+					g.Expect(cond.Reason).To(Equal(validated))
+					g.Expect(wc.Status.MaintenanceReadiness).To(Equal(readiness))
+					cond = meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeMaintenanceAllowed)
+					g.Expect(cond).NotTo(BeNil())
+					g.Expect(cond.Message).To(ContainSubstring(msg))
+				}).Should(Succeed())
+			}
+			setEnforcedClass := func(name string) {
+				GinkgoHelper()
+				namespace := &corev1.Namespace{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ns}, namespace)).To(Succeed())
+				patch := client.MergeFrom(namespace.DeepCopy())
+				if name == "" {
+					delete(namespace.Labels, workloadsv1alpha1.EnforcedWorkloadClassLabel)
+				} else {
+					metav1.SetMetaDataLabel(&namespace.ObjectMeta, workloadsv1alpha1.EnforcedWorkloadClassLabel, name)
+				}
+				Expect(k8sClient.Patch(ctx, namespace, patch)).To(Succeed())
+			}
+			const bothPods = "2 selected Pods"
+
+			By("reporting SelectorOverlap on both WorkloadClasses without an enforced class")
+			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
+			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
+
+			By("counting every Pod for the enforced class only, and not reporting overlap, once the label is set")
+			setEnforcedClass("wc-broad")
+			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessNotReady, bothPods)
+			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessReady, "")
+
+			By("moving the Pods to the new enforced class when the label changes")
+			setEnforcedClass("wc-web")
+			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessReady, "")
+			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessNotReady, bothPods)
+
+			By("counting the Pods for no WorkloadClass when the label names a missing WorkloadClass")
+			setEnforcedClass("wc-missing")
+			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessReady, "")
+			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessReady, "")
+
+			By("reporting SelectorOverlap again once the label is removed")
+			setEnforcedClass("")
+			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
+			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
+		})
 	})
 })
 
@@ -790,6 +877,26 @@ func testWorkloadClass(name, namespace string, matchLabels map[string]string) *w
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: workloadsv1alpha1.WorkloadClassSpec{
 			PodSelector: &metav1.LabelSelector{MatchLabels: matchLabels},
+		},
+	}
+}
+
+// testEnforcingNamespace returns a Namespace whose workloads.x-k8s.io/enforced-class label names enforcedClass.
+func testEnforcingNamespace(name, enforcedClass string) *corev1.Namespace {
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name:   name,
+		Labels: map[string]string{workloadsv1alpha1.EnforcedWorkloadClassLabel: enforcedClass},
+	}}
+}
+
+// namespaceGetError returns interceptor functions that fail every Get of a Namespace with err.
+func namespaceGetError(err error) interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Namespace); ok {
+				return err
+			}
+			return c.Get(ctx, key, obj, opts...)
 		},
 	}
 }
@@ -853,6 +960,19 @@ func TestOverlappingWorkloadClasses(t *testing.T) {
 				testWorkloadClass("wc-same-2", ns, nginx),
 			},
 			wantNames: []string{"wc-same-1", "wc-same-2", "wc-same-3"},
+		},
+		{
+			name:     "enforced_namespace_does_not_report_overlap",
+			existing: []client.Object{wcCurrent, testWorkloadClass("wc-same", ns, nginx), testEnforcingNamespace(ns, "wc-current")},
+		},
+		{
+			name:     "enforced_label_naming_a_missing_class_does_not_report_overlap",
+			existing: []client.Object{wcCurrent, testWorkloadClass("wc-same", ns, nginx), testEnforcingNamespace(ns, "wc-missing")},
+		},
+		{
+			name:      "empty_enforced_label_reports_overlap",
+			existing:  []client.Object{wcCurrent, testWorkloadClass("wc-same", ns, nginx), testEnforcingNamespace(ns, "")},
+			wantNames: []string{"wc-same"},
 		},
 	}
 	for _, tc := range testCases {
@@ -1110,6 +1230,14 @@ func TestWorkloadClassMapFuncs(t *testing.T) {
 		want := []string{"ns-1/wc-b"}
 		if !slices.Equal(got, want) {
 			t.Errorf("workloadClassesInNamespace() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("every_workload_class_in_a_namespace", func(t *testing.T) {
+		got := names(r.namespaceWorkloadClasses(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns-1"}}))
+		want := []string{"ns-1/wc-a", "ns-1/wc-b"}
+		if !slices.Equal(got, want) {
+			t.Errorf("namespaceWorkloadClasses() = %v, want %v", got, want)
 		}
 	})
 }
@@ -1690,6 +1818,19 @@ func TestCalculateReadiness(t *testing.T) {
 			wantRequeue:         time.Hour + transitionRequeueDelay,
 			wantLastTermination: ptr.To(now),
 		},
+		{
+			name: "young_pods_governed_by_a_more_specific_class_do_not_block",
+			wc: newWC(func(p *workloadsv1alpha1.DisruptionPolicy) {
+				p.MinInitialRunDurationDays = 1
+			}),
+			validated: validated,
+			pods: []client.Object{
+				testPod("young-web", map[string]string{"app": "nginx", "tier": "web"}, now),
+				testWorkloadClass("wc-web", "ns", map[string]string{"app": "nginx", "tier": "web"}),
+			},
+			wantReadiness: workloadsv1alpha1.ReadinessReady,
+			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2017,6 +2158,206 @@ func TestWorkloadClassesSelectingPod(t *testing.T) {
 	want := []string{"ns/wc-everything", "ns/wc-nginx"}
 	if !slices.Equal(got, want) {
 		t.Errorf("workloadClassesSelectingPod() = %v, want %v", got, want)
+	}
+}
+
+func TestWorkloadClassesSelectingPodInEnforcedNamespace(t *testing.T) {
+	wcs := []client.Object{
+		testWorkloadClass("wc-nginx", "ns", map[string]string{"app": "nginx"}),
+		testWorkloadClass("wc-redis", "ns", map[string]string{"app": "redis"}),
+	}
+	testCases := []struct {
+		name    string
+		ns      *corev1.Namespace
+		nsError error
+		want    []string
+	}{
+		{
+			name: "enforced_class_regardless_of_selector",
+			ns:   testEnforcingNamespace("ns", "wc-redis"),
+			want: []string{"ns/wc-redis"},
+		},
+		{
+			name: "enforced_label_naming_a_missing_class",
+			ns:   testEnforcingNamespace("ns", "wc-missing"),
+			want: []string{},
+		},
+		{
+			name:    "namespace_read_error_requeues_every_class_in_the_namespace",
+			nsError: fmt.Errorf("namespaces are unavailable"),
+			want:    []string{"ns/wc-nginx", "ns/wc-redis"},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newTestScheme(t)
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wcs...)
+			if tc.ns != nil {
+				builder = builder.WithObjects(tc.ns)
+			}
+			if tc.nsError != nil {
+				builder = builder.WithInterceptorFuncs(namespaceGetError(tc.nsError))
+			}
+			r := &WorkloadClassReconciler{Client: builder.Build(), Scheme: scheme}
+
+			reqs := r.workloadClassesSelectingPod(t.Context(), testPod("pod", map[string]string{"app": "nginx"}, time.Now()))
+			got := make([]string, 0, len(reqs))
+			for _, req := range reqs {
+				got = append(got, req.String())
+			}
+			slices.Sort(got)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("workloadClassesSelectingPod() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnforcedClassLabelChangedPredicate(t *testing.T) {
+	ns := func(nsLabels map[string]string) *corev1.Namespace {
+		return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ns", Labels: nsLabels}}
+	}
+	unlabeled := ns(map[string]string{"team": "a"})
+	enforcedA := ns(map[string]string{workloadsv1alpha1.EnforcedWorkloadClassLabel: "wc-a"})
+	enforcedB := ns(map[string]string{workloadsv1alpha1.EnforcedWorkloadClassLabel: "wc-b"})
+	enforcedEmpty := ns(map[string]string{workloadsv1alpha1.EnforcedWorkloadClassLabel: ""})
+	enforcedARelabeled := ns(map[string]string{workloadsv1alpha1.EnforcedWorkloadClassLabel: "wc-a", "team": "b"})
+
+	p := enforcedClassLabelChangedPredicate()
+	createCases := []struct {
+		name string
+		ns   *corev1.Namespace
+		want bool
+	}{
+		{name: "create_with_label", ns: enforcedA, want: true},
+		{name: "create_without_label", ns: unlabeled, want: false},
+		{name: "create_with_empty_label", ns: enforcedEmpty, want: false},
+	}
+	for _, tc := range createCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.Create(event.CreateEvent{Object: tc.ns}); got != tc.want {
+				t.Errorf("Create() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	updateCases := []struct {
+		name         string
+		oldNS, newNS *corev1.Namespace
+		want         bool
+	}{
+		{name: "label_added", oldNS: unlabeled, newNS: enforcedA, want: true},
+		{name: "label_changed", oldNS: enforcedA, newNS: enforcedB, want: true},
+		{name: "label_removed", oldNS: enforcedA, newNS: unlabeled, want: true},
+		{name: "label_unchanged", oldNS: enforcedA, newNS: enforcedARelabeled, want: false},
+		{name: "empty_label_added", oldNS: unlabeled, newNS: enforcedEmpty, want: false},
+	}
+	for _, tc := range updateCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.Update(event.UpdateEvent{ObjectOld: tc.oldNS, ObjectNew: tc.newNS}); got != tc.want {
+				t.Errorf("Update() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	if p.Delete(event.DeleteEvent{Object: enforcedA}) {
+		t.Error("Delete() = true, want false")
+	}
+	if p.Generic(event.GenericEvent{Object: enforcedA}) {
+		t.Error("Generic() = true, want false")
+	}
+}
+
+func TestGovernedPods(t *testing.T) {
+	nginx := map[string]string{"app": "nginx"}
+	nginxWeb := map[string]string{"app": "nginx", "tier": "web"}
+	wcNginx := testWorkloadClass("wc-nginx", "ns", nginx)
+	wcNginxWeb := testWorkloadClass("wc-nginx-web", "ns", nginxWeb)
+	wcNil := testWorkloadClass("wc-nil", "ns", nil)
+	wcNil.Spec.PodSelector = nil
+	objects := []client.Object{
+		wcNginx, wcNginxWeb, wcNil,
+		testPod("pod-nginx", nginx, time.Now()),
+		testPod("pod-nginx-web", nginxWeb, time.Now()),
+		testPod("pod-redis", map[string]string{"app": "redis"}, time.Now()),
+	}
+
+	testCases := []struct {
+		name string
+		wc   *workloadsv1alpha1.WorkloadClass
+		ns   *corev1.Namespace
+		want []string
+	}{
+		{
+			name: "best_match_excludes_pods_of_a_more_specific_class",
+			wc:   wcNginx,
+			want: []string{"pod-nginx"},
+		},
+		{
+			name: "more_specific_class_governs_its_pods",
+			wc:   wcNginxWeb,
+			want: []string{"pod-nginx-web"},
+		},
+		{
+			name: "nil_selector_governs_nothing",
+			wc:   wcNil,
+		},
+		{
+			name: "enforced_class_governs_every_pod_regardless_of_selector",
+			wc:   wcNil,
+			ns:   testEnforcingNamespace("ns", "wc-nil"),
+			want: []string{"pod-nginx", "pod-nginx-web", "pod-redis"},
+		},
+		{
+			name: "other_classes_in_an_enforced_namespace_govern_nothing",
+			wc:   wcNginxWeb,
+			ns:   testEnforcingNamespace("ns", "wc-nginx"),
+		},
+		{
+			name: "enforced_label_naming_a_missing_class_governs_nothing",
+			wc:   wcNginx,
+			ns:   testEnforcingNamespace("ns", "wc-missing"),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newTestScheme(t)
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...)
+			if tc.ns != nil {
+				builder = builder.WithObjects(tc.ns)
+			}
+			r := &WorkloadClassReconciler{Client: builder.Build(), Scheme: scheme}
+
+			pods, err := r.governedPods(t.Context(), tc.wc)
+			if err != nil {
+				t.Fatalf("governedPods() returned unexpected error: %v", err)
+			}
+			got := make([]string, 0, len(pods))
+			for _, pod := range pods {
+				got = append(got, pod.Name)
+			}
+			slices.Sort(got)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("governedPods() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNamespaceReadErrorsAreReturned(t *testing.T) {
+	wc := testWorkloadClass("wc", "ns", map[string]string{"app": "nginx"})
+	nsErr := fmt.Errorf("namespaces are unavailable")
+	scheme := newTestScheme(t)
+	r := &WorkloadClassReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(wc).WithInterceptorFuncs(namespaceGetError(nsErr)).Build(),
+		Scheme: scheme,
+	}
+
+	if _, err := r.overlappingWorkloadClasses(t.Context(), wc); !stderrors.Is(err, nsErr) {
+		t.Errorf("overlappingWorkloadClasses() error = %v, want %v", err, nsErr)
+	}
+	if _, err := r.governedPods(t.Context(), wc); !stderrors.Is(err, nsErr) {
+		t.Errorf("governedPods() error = %v, want %v", err, nsErr)
 	}
 }
 

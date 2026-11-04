@@ -82,6 +82,7 @@ type WorkloadClassReconciler struct {
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclassguardrails,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -292,11 +293,16 @@ func validateAgainstGuardrails(wc *workloadsv1alpha1.WorkloadClass, guardrails [
 // the namespace is reported with ReasonSelectorOverlap. WorkloadClasses that are being deleted or have an
 // invalid PodSelector are skipped; an invalid PodSelector is reported on the WorkloadClass that owns it.
 //
-// TODO: Skip selector overlap checks when the Namespace has the workloads.x-k8s.io/enforced-class
-// (EnforcedWorkloadClassLabel) label set to an active WorkloadClass, once the controller watches Namespaces.
+// No overlap is reported when the Namespace has the workloads.x-k8s.io/enforced-class (EnforcedWorkloadClassLabel)
+// label set, even if it names a WorkloadClass that does not exist: the label overrides PodSelector matching for every
+// Pod in the Namespace, so the PodSelectors are not used there.
 func (r *WorkloadClassReconciler) overlappingWorkloadClasses(
 	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass,
 ) ([]workloadsv1alpha1.WorkloadClass, error) {
+	if _, enforced, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace); err != nil || enforced {
+		return nil, err
+	}
+
 	workloadClasses := &workloadsv1alpha1.WorkloadClassList{}
 	if err := r.List(ctx, workloadClasses, client.InNamespace(wc.Namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %w", err)
@@ -379,15 +385,15 @@ func (r readinessResult) condition(generation int64) metav1.Condition {
 //  2. Ready if EmergencyOverride is set.
 //  3. Overdue if it has remained undisrupted for at least MaxNonDisruptionDurationDays.
 //  4. NotReady if the current time is outside of every AllowedDisruptionWindow.
-//  5. NotReady if a selected Pod has not yet run for MinInitialRunDurationDays, or a selected Pod started terminating
-//     less than GraceTerminationDurationSeconds ago.
+//  5. NotReady if a governed Pod has not yet run for MinInitialRunDurationDays, or a governed Pod started terminating
+//     less than GraceTerminationDurationSeconds ago (see governedPods).
 //  6. Ready otherwise.
 //
 // Unless the readiness only changes when the cluster changes (Unknown, EmergencyOverride, or Overdue), the
 // WorkloadClass is requeued at the earliest of: the next disruption window start or end, the time it becomes overdue,
-// and the time the selected Pods stop blocking maintenance.
+// and the time the governed Pods stop blocking maintenance.
 //
-// As a side effect, Status.LastPodTerminationTime is advanced to the most recent time a selected Pod was observed to
+// As a side effect, Status.LastPodTerminationTime is advanced to the most recent time a governed Pod was observed to
 // start terminating, so that GraceTerminationDurationSeconds is honored after the Pod is gone.
 func (r *WorkloadClassReconciler) calculateReadiness(
 	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, validated metav1.Condition,
@@ -407,11 +413,11 @@ func (r *WorkloadClassReconciler) calculateReadiness(
 	policy := wc.Spec.DisruptionPolicy
 	now := r.now()
 
-	// Observe the selected Pods on every reconcile so that terminating Pods are recorded before they are gone.
+	// Observe the governed Pods on every reconcile so that terminating Pods are recorded before they are gone.
 	var pods []corev1.Pod
 	if policy.MinInitialRunDurationDays > 0 || policy.GraceTerminationDurationSeconds > 0 {
 		var err error
-		if pods, err = r.selectedPods(ctx, wc); err != nil {
+		if pods, err = r.governedPods(ctx, wc); err != nil {
 			return readinessResult{}, err
 		}
 		recordPodTerminations(wc, pods)
@@ -470,25 +476,56 @@ func (r *WorkloadClassReconciler) now() time.Time {
 	return r.Clock.Now().UTC()
 }
 
-// selectedPods returns the Pods in the namespace of the WorkloadClass that are selected by its PodSelector.
-// A nil PodSelector selects no Pods, and an empty PodSelector selects every Pod in the namespace.
+// governedPods returns the Pods in the namespace of the WorkloadClass that it governs, including terminating Pods and
+// Pods in a terminal phase:
 //
-// TODO: Select every Pod in the namespace when the Namespace has the workloads.x-k8s.io/enforced-class
-// (EnforcedWorkloadClassLabel) label set to the WorkloadClass, once the controller watches Namespaces.
-func (r *WorkloadClassReconciler) selectedPods(ctx context.Context, wc *workloadsv1alpha1.WorkloadClass) ([]corev1.Pod, error) {
-	if wc.Spec.PodSelector == nil {
-		return nil, nil
-	}
-	selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
+//   - If the Namespace has the workloads.x-k8s.io/enforced-class (EnforcedWorkloadClassLabel) label set, the enforced
+//     WorkloadClass governs every Pod in the namespace, and the other WorkloadClasses govern none. If the label names
+//     a WorkloadClass that does not exist or is being deleted, no WorkloadClass governs the namespace's Pods.
+//   - Otherwise, the WorkloadClass governs the Pods that its PodSelector selects and for which it is the best match
+//     among the WorkloadClasses in the namespace (see utils.SelectorBestMatch). A nil PodSelector governs no Pods.
+func (r *WorkloadClassReconciler) governedPods(ctx context.Context, wc *workloadsv1alpha1.WorkloadClass) ([]corev1.Pod, error) {
+	enforcedWC, enforced, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
 	if err != nil {
-		return nil, fmt.Errorf("invalid podSelector: %w", err)
+		return nil, err
+	}
+
+	selector := labels.Everything()
+	if enforced {
+		if enforcedWC == nil || enforcedWC.Name != wc.Name {
+			return nil, nil
+		}
+	} else {
+		if wc.Spec.PodSelector == nil {
+			return nil, nil
+		}
+		if selector, err = metav1.LabelSelectorAsSelector(wc.Spec.PodSelector); err != nil {
+			return nil, fmt.Errorf("invalid podSelector: %w", err)
+		}
 	}
 
 	pods := &corev1.PodList{}
 	if err := r.List(ctx, pods, client.InNamespace(wc.Namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
 		return nil, fmt.Errorf("failed to list Pods: %w", err)
 	}
-	return pods.Items, nil
+	if enforced || len(pods.Items) == 0 {
+		return pods.Items, nil
+	}
+
+	workloadClasses := &workloadsv1alpha1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses, client.InNamespace(wc.Namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list WorkloadClasses: %w", err)
+	}
+	// Rank the WorkloadClass as it is being reconciled, in case the list holds an older copy or does not include it.
+	candidates := slices.DeleteFunc(workloadClasses.Items, func(other workloadsv1alpha1.WorkloadClass) bool {
+		return other.Name == wc.Name
+	})
+	candidates = append(candidates, *wc)
+
+	return slices.DeleteFunc(pods.Items, func(pod corev1.Pod) bool {
+		bestMatch, _, _ := utils.SelectorBestMatch(&pod, candidates)
+		return bestMatch == nil || bestMatch.Name != wc.Name
+	}), nil
 }
 
 // recordPodTerminations advances Status.LastPodTerminationTime of the WorkloadClass to the most recent time one of
@@ -689,6 +726,13 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.workloadClassesSelectingPod),
 			builder.WithPredicates(podReadinessPredicate()),
 		).
+		// Re-validate and re-calculate the maintenance readiness of every WorkloadClass in a Namespace when its enforced
+		// WorkloadClass changes, since that changes which Pods each WorkloadClass governs and whether overlap applies.
+		Watches(
+			&corev1.Namespace{},
+			handler.EnqueueRequestsFromMapFunc(r.namespaceWorkloadClasses),
+			builder.WithPredicates(enforcedClassLabelChangedPredicate()),
+		).
 		Named("workloadclass").
 		Complete(r)
 }
@@ -744,10 +788,40 @@ func podReadinessPredicate() predicate.Funcs {
 	}
 }
 
-// workloadClassesSelectingPod maps a Pod to reconcile requests for the WorkloadClasses in its namespace whose
-// PodSelector selects it. On updates, it is called for both the old and the new Pod, so WorkloadClasses that stop
-// selecting a Pod after a label change are also re-queued.
+// enforcedClassLabelChangedPredicate passes Namespace creations with a non-empty workloads.x-k8s.io/enforced-class
+// (EnforcedWorkloadClassLabel) label, and Namespace updates that set, change, or remove it. Deletions are ignored,
+// since deleting a Namespace deletes its WorkloadClasses.
+func enforcedClassLabelChangedPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return e.Object.GetLabels()[workloadsv1alpha1.EnforcedWorkloadClassLabel] != ""
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return e.ObjectOld.GetLabels()[workloadsv1alpha1.EnforcedWorkloadClassLabel] !=
+				e.ObjectNew.GetLabels()[workloadsv1alpha1.EnforcedWorkloadClassLabel]
+		},
+		DeleteFunc:  func(event.DeleteEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
+// workloadClassesSelectingPod maps a Pod to reconcile requests for the WorkloadClasses that can govern it: the
+// Namespace's enforced WorkloadClass if the Namespace has the workloads.x-k8s.io/enforced-class label set (none if it
+// names a WorkloadClass that does not exist), and otherwise the WorkloadClasses in its namespace whose PodSelector
+// selects it. On updates, it is called for both the old and the new Pod, so WorkloadClasses that stop selecting a Pod
+// after a label change are also re-queued. If the Namespace cannot be read, every WorkloadClass in it is re-queued.
 func (r *WorkloadClassReconciler) workloadClassesSelectingPod(ctx context.Context, obj client.Object) []reconcile.Request {
+	enforcedWC, enforced, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, obj.GetNamespace())
+	switch {
+	case err != nil:
+		logf.FromContext(ctx).Error(err, "Failed to get the enforced WorkloadClass", "namespace", obj.GetNamespace())
+		return r.workloadClassRequests(ctx, client.InNamespace(obj.GetNamespace()))
+	case enforced && enforcedWC == nil:
+		return nil
+	case enforced:
+		return []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(enforcedWC)}}
+	}
+
 	workloadClasses := &workloadsv1alpha1.WorkloadClassList{}
 	if err := r.List(ctx, workloadClasses, client.InNamespace(obj.GetNamespace())); err != nil {
 		logf.FromContext(ctx).Error(err, "Failed to list WorkloadClasses", "namespace", obj.GetNamespace())
@@ -784,6 +858,11 @@ func (r *WorkloadClassReconciler) workloadClassesInNamespace(ctx context.Context
 		}
 	}
 	return others
+}
+
+// namespaceWorkloadClasses maps a Namespace to reconcile requests for every WorkloadClass in it.
+func (r *WorkloadClassReconciler) namespaceWorkloadClasses(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.workloadClassRequests(ctx, client.InNamespace(obj.GetName()))
 }
 
 func (r *WorkloadClassReconciler) workloadClassRequests(ctx context.Context, opts ...client.ListOption) []reconcile.Request {
