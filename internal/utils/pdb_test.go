@@ -267,3 +267,102 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 		})
 	}
 }
+
+func TestIsWorkloadClassManagedPDB(t *testing.T) {
+	controllerRef := func(apiVersion, kind string, controller bool) metav1.OwnerReference {
+		return metav1.OwnerReference{APIVersion: apiVersion, Kind: kind, Name: testWCName, UID: "wc-uid", Controller: &controller}
+	}
+	pdbWithOwners := func(refs ...metav1.OwnerReference) *policyv1.PodDisruptionBudget {
+		return &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: PDBName(testPodName), Namespace: testNamespace, OwnerReferences: refs}}
+	}
+	gv := workloadsv1alpha1.GroupVersion.String()
+
+	tests := []struct {
+		name string
+		pdb  *policyv1.PodDisruptionBudget
+		want bool
+	}{
+		{name: "nil_pdb", pdb: nil, want: false},
+		{name: "no_owner", pdb: pdbWithOwners(), want: false},
+		{name: "workload_class_controller", pdb: pdbWithOwners(controllerRef(gv, "WorkloadClass", true)), want: true},
+		{name: "workload_class_other_version", pdb: pdbWithOwners(controllerRef("workloads.x-k8s.io/v1beta1", "WorkloadClass", true)), want: true},
+		{name: "workload_class_not_controller", pdb: pdbWithOwners(controllerRef(gv, "WorkloadClass", false)), want: false},
+		{name: "workload_class_kind_from_other_group", pdb: pdbWithOwners(controllerRef("example.com/v1", "WorkloadClass", true)), want: false},
+		{name: "other_controller", pdb: pdbWithOwners(controllerRef("apps/v1", "Deployment", true)), want: false},
+		{name: "invalid_api_version", pdb: pdbWithOwners(controllerRef("a/b/c", "WorkloadClass", true)), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsWorkloadClassManagedPDB(tt.pdb); got != tt.want {
+				t.Errorf("IsWorkloadClassManagedPDB() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsPodCoveredByUserPDB(t *testing.T) {
+	isController := true
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: testPodName, Namespace: testNamespace, UID: testPodUID,
+		Labels: map[string]string{"app": "web", "tier": "frontend"},
+	}}
+	userPDB := func(namespace string, selector *metav1.LabelSelector) policyv1.PodDisruptionBudget {
+		return policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{Name: "user-pdb", Namespace: namespace},
+			Spec:       policyv1.PodDisruptionBudgetSpec{Selector: selector},
+		}
+	}
+	managedPDB := userPDB(testNamespace, &metav1.LabelSelector{})
+	managedPDB.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: workloadsv1alpha1.GroupVersion.String(), Kind: "WorkloadClass", Name: testWCName, UID: "wc-uid", Controller: &isController,
+	}}
+
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		pdbs []policyv1.PodDisruptionBudget
+		want bool
+	}{
+		{name: "nil_pod", pod: nil, pdbs: []policyv1.PodDisruptionBudget{userPDB(testNamespace, &metav1.LabelSelector{})}, want: false},
+		{name: "no_pdbs", pod: pod, want: false},
+		{name: "matching_labels", pod: pod, pdbs: []policyv1.PodDisruptionBudget{
+			userPDB(testNamespace, &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}),
+		}, want: true},
+		{name: "matching_expressions", pod: pod, pdbs: []policyv1.PodDisruptionBudget{
+			userPDB(testNamespace, &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "tier", Operator: metav1.LabelSelectorOpIn, Values: []string{"frontend", "backend"}},
+			}}),
+		}, want: true},
+		{name: "empty_selector_selects_every_pod", pod: pod, pdbs: []policyv1.PodDisruptionBudget{
+			userPDB(testNamespace, &metav1.LabelSelector{}),
+		}, want: true},
+		{name: "nil_selector_selects_no_pods", pod: pod, pdbs: []policyv1.PodDisruptionBudget{
+			userPDB(testNamespace, nil),
+		}, want: false},
+		{name: "non_matching_selector", pod: pod, pdbs: []policyv1.PodDisruptionBudget{
+			userPDB(testNamespace, &metav1.LabelSelector{MatchLabels: map[string]string{"app": "db"}}),
+		}, want: false},
+		{name: "other_namespace", pod: pod, pdbs: []policyv1.PodDisruptionBudget{
+			userPDB("other", &metav1.LabelSelector{}),
+		}, want: false},
+		{name: "invalid_selector_is_ignored", pod: pod, pdbs: []policyv1.PodDisruptionBudget{
+			userPDB(testNamespace, &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "app", Operator: "Bogus"},
+			}}),
+		}, want: false},
+		{name: "managed_pdb_is_ignored", pod: pod, pdbs: []policyv1.PodDisruptionBudget{managedPDB}, want: false},
+		{name: "managed_and_user_pdbs", pod: pod, pdbs: []policyv1.PodDisruptionBudget{
+			managedPDB,
+			userPDB(testNamespace, &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}),
+		}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPodCoveredByUserPDB(tt.pod, tt.pdbs); got != tt.want {
+				t.Errorf("IsPodCoveredByUserPDB() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

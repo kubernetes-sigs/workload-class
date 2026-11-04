@@ -24,6 +24,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	workloadsv1alpha1 "sigs.k8s.io/workload-class/api/v1alpha1"
@@ -32,6 +34,9 @@ import (
 const (
 	// PDBNamePrefix is the prefix of the name of every PodDisruptionBudget managed by a WorkloadClass.
 	PDBNamePrefix = "workload-"
+
+	// workloadClassKind is the Kind of the controller OwnerReference of a PodDisruptionBudget managed by a WorkloadClass.
+	workloadClassKind = "WorkloadClass"
 
 	// MaxPDBNameLength is the maximum length of a PodDisruptionBudget name (a DNS-1123 subdomain).
 	MaxPDBNameLength = 253
@@ -151,4 +156,52 @@ func SyncPDBWithWorkloadClass(
 		pdb.Spec.MaxUnavailable = &closed
 	}
 	return nil
+}
+
+// IsWorkloadClassManagedPDB reports whether the PodDisruptionBudget is managed by a WorkloadClass, i.e. its
+// controller OwnerReference is a WorkloadClass of the workloads.x-k8s.io group (any version).
+//
+// Every other PDB is user-created. The WorkloadClass controller never modifies a user-created PDB, even one named
+// like a managed PDB (see PDBName).
+func IsWorkloadClassManagedPDB(pdb *policyv1.PodDisruptionBudget) bool {
+	if pdb == nil {
+		return false
+	}
+	owner := metav1.GetControllerOf(pdb)
+	if owner == nil || owner.Kind != workloadClassKind {
+		return false
+	}
+	gv, err := schema.ParseGroupVersion(owner.APIVersion)
+	return err == nil && gv.Group == workloadsv1alpha1.GroupVersion.Group
+}
+
+// IsPodCoveredByUserPDB reports whether any user-created PodDisruptionBudget in pdbs (see IsWorkloadClassManagedPDB)
+// is in the Pod's namespace and selects the Pod. PDBs managed by a WorkloadClass are ignored, so callers can pass
+// every PDB in the namespace.
+//
+// User-created PDBs take precedence: the eviction API rejects evicting a Pod that is covered by more than one PDB,
+// so the WorkloadClass controller does not create a PDB for a Pod that a user-created PDB covers, and relies on the
+// eviction webhook to enforce the WorkloadClass' disruption policy for it.
+//
+// Selectors follow policy/v1 semantics: a nil selector selects no Pods, and an empty selector ({}) selects every Pod
+// in the namespace. PDBs with an invalid selector are ignored.
+func IsPodCoveredByUserPDB(pod *corev1.Pod, pdbs []policyv1.PodDisruptionBudget) bool {
+	if pod == nil {
+		return false
+	}
+	podLabels := labels.Set(pod.Labels)
+	for i := range pdbs {
+		pdb := &pdbs[i]
+		if pdb.Namespace != pod.Namespace || pdb.Spec.Selector == nil || IsWorkloadClassManagedPDB(pdb) {
+			continue
+		}
+		selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+		if err != nil {
+			continue
+		}
+		if selector.Matches(podLabels) {
+			return true
+		}
+	}
+	return false
 }
