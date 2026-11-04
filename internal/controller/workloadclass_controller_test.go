@@ -1008,6 +1008,68 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Patch(ctx, relabeled, patch)).To(Succeed())
 			eventuallyPDBsFor("cleanup-1")
 		})
+
+		It("should delete the Per-Pod PDB of a Pod that a user-created PDB covers, and recreate it when the user-created PDB is deleted", func() {
+			Expect(k8sClient.Create(ctx, &workloadsv1alpha1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: guardrailName},
+				Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{Constraints: workloadsv1alpha1.Constraints{
+					Disruption: workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 10},
+				}},
+			})).To(Succeed())
+			Expect(k8sClient.Create(ctx, &workloadsv1alpha1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "wc-user-pdb", Namespace: namespace},
+				Spec: workloadsv1alpha1.WorkloadClassSpec{
+					PodSelector:      &metav1.LabelSelector{MatchLabels: map[string]string{"app": "user-pdb"}},
+					DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{MaxNonDisruptionDurationDays: 7},
+				},
+			})).To(Succeed())
+			for name, role := range map[string]string{"user-pdb-1": "primary", "user-pdb-2": "replica"} {
+				Expect(k8sClient.Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{"app": "user-pdb", "role": role}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+				})).To(Succeed())
+			}
+			eventuallyManagedPDBsFor := func(podNames ...string) {
+				GinkgoHelper()
+				want := make([]string, 0, len(podNames))
+				for _, name := range podNames {
+					want = append(want, utils.PDBName(name))
+				}
+				Eventually(func(g Gomega) {
+					pdbs := &policyv1.PodDisruptionBudgetList{}
+					g.Expect(k8sClient.List(ctx, pdbs, client.InNamespace(namespace))).To(Succeed())
+					var got []string
+					for _, pdb := range pdbs.Items {
+						if utils.IsWorkloadClassManagedPDB(&pdb) {
+							got = append(got, pdb.Name)
+						}
+					}
+					g.Expect(got).To(ConsistOf(want))
+				}).Should(Succeed())
+			}
+
+			By("creating a PDB for each Pod")
+			eventuallyManagedPDBsFor("user-pdb-1", "user-pdb-2")
+
+			By("deleting the PDB of the Pod that a new user-created PDB selects, leaving the user-created PDB untouched")
+			userSpec := policyv1.PodDisruptionBudgetSpec{
+				MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+				Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"role": "primary"}},
+			}
+			userPDB := &policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{Name: "user-pdb", Namespace: namespace},
+				Spec:       *userSpec.DeepCopy(),
+			}
+			Expect(k8sClient.Create(ctx, userPDB)).To(Succeed())
+			eventuallyManagedPDBsFor("user-pdb-2")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(userPDB), userPDB)).To(Succeed())
+			Expect(userPDB.OwnerReferences).To(BeEmpty())
+			Expect(userPDB.Spec).To(Equal(userSpec))
+
+			By("recreating the PDB when the user-created PDB is deleted")
+			Expect(k8sClient.Delete(ctx, userPDB)).To(Succeed())
+			eventuallyManagedPDBsFor("user-pdb-1", "user-pdb-2")
+		})
 	})
 })
 
@@ -1405,6 +1467,15 @@ func TestWorkloadClassMapFuncs(t *testing.T) {
 		want := []string{"ns-1/wc-a", "ns-1/wc-b"}
 		if !slices.Equal(got, want) {
 			t.Errorf("namespaceWorkloadClasses() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("every_workload_class_in_the_namespace_of_an_object", func(t *testing.T) {
+		pdb := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "user-pdb", Namespace: "ns-1"}}
+		got := names(r.objectNamespaceWorkloadClasses(context.Background(), pdb))
+		want := []string{"ns-1/wc-a", "ns-1/wc-b"}
+		if !slices.Equal(got, want) {
+			t.Errorf("objectNamespaceWorkloadClasses() = %v, want %v", got, want)
 		}
 	})
 }
@@ -2324,10 +2395,17 @@ func TestReconcilePDBs(t *testing.T) {
 	deletingWC.DeletionTimestamp = ptr.To(metav1.Now())
 	succeeded := testPDBPod("succeeded", nginx)
 	succeeded.Status.Phase = corev1.PodSucceeded
-	userPDB := &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{Name: "workload-web-1", Namespace: "ns"},
-		Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "unrelated"}}},
+	newUserPDB := func(name string, selector *metav1.LabelSelector) *policyv1.PodDisruptionBudget {
+		return &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"},
+			Spec:       policyv1.PodDisruptionBudgetSpec{Selector: selector},
+		}
 	}
+	userPDB := newUserPDB("workload-web-1", &metav1.LabelSelector{MatchLabels: map[string]string{"app": "unrelated"}})
+	// coveringPDB is a user-created PDB that covers the Pods labeled user-pdb=yes, such as coveredPod.
+	coveredLabels := map[string]string{"user-pdb": "yes"}
+	coveringPDB := newUserPDB("user", &metav1.LabelSelector{MatchLabels: coveredLabels})
+	coveredPod := testPDBPod("web-1", map[string]string{"app": "nginx", "user-pdb": "yes"})
 	// wc-web is more specific than wc for the Pod web-1.
 	webPod := testPDBPod("web-1", map[string]string{"app": "nginx", "tier": "web"})
 	webWC := func(cond metav1.Condition) *workloadsv1alpha1.WorkloadClass {
@@ -2339,6 +2417,7 @@ func TestReconcilePDBs(t *testing.T) {
 	deletingWebWC := webWC(passed)
 	deletingWebWC.DeletionTimestamp = ptr.To(metav1.Now())
 	deletingWebWC.Finalizers = []string{"workloads.x-k8s.io/test"}
+	coveredWebPod := testPDBPod("web-1", map[string]string{"app": "nginx", "tier": "web", "user-pdb": "yes"})
 	protectingWC := notReadyWC.DeepCopy()
 	protectingWC.Status.Conditions = []metav1.Condition{passed}
 	// Pods whose PDB name is truncated, carrying the Pod UID label that the controller adds. utils.PDBName trims the
@@ -2371,6 +2450,7 @@ func TestReconcilePDBs(t *testing.T) {
 		objects   []client.Object
 		wantErr   string
 		wantPDBs  map[string]*wantPDB // PDB name -> expected PDB, or nil if it must not exist
+		unlabeled []string            // Pods that must not get the PodUIDLabel label
 	}{
 		{
 			name:      "not_ready_class_creates_closed_pdbs_for_governed_pods",
@@ -2503,14 +2583,91 @@ func TestReconcilePDBs(t *testing.T) {
 			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil},
 		},
 		{
-			name:      "user_pdb_with_the_same_name_is_left_untouched",
+			name:      "user_pdb_with_the_same_name_that_does_not_cover_the_pod_skips_it",
 			wc:        readyWC,
 			validated: passed,
 			objects:   []client.Object{testPDBPod("web-1", nginx), testPDBPod("web-2", nginx), userPDB},
-			wantErr:   "PodDisruptionBudget ns/workload-web-1 already exists and is not managed by a WorkloadClass",
 			wantPDBs: map[string]*wantPDB{
 				"workload-web-1": {},
 				"workload-web-2": {owner: "wc", maxUnavailable: "100%"},
+			},
+		},
+		{
+			name:      "user_pdb_with_the_same_name_that_covers_the_pod_skips_it",
+			wc:        readyWC,
+			validated: passed,
+			objects: []client.Object{
+				coveredPod, testPDBPod("web-2", nginx), newUserPDB("workload-web-1", &metav1.LabelSelector{MatchLabels: coveredLabels}),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {},
+				"workload-web-2": {owner: "wc", maxUnavailable: "100%"},
+			},
+			unlabeled: []string{"web-1"},
+		},
+		{
+			name:      "pod_covered_by_a_user_pdb_gets_no_pdb",
+			wc:        notReadyWC,
+			validated: passed,
+			objects:   []client.Object{coveredPod, testPDBPod("web-2", nginx), coveringPDB},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": nil,
+				"workload-web-2": {owner: "wc", maxUnavailable: "0"},
+				"user":           {},
+			},
+			unlabeled: []string{"web-1"},
+		},
+		{
+			name:      "pdb_is_deleted_when_a_user_pdb_starts_covering_the_pod",
+			wc:        notReadyWC,
+			validated: passed,
+			objects:   []client.Object{coveredPod, testOwnedPDB(notReadyWC, coveredPod, closed), coveringPDB},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil, "user": {}},
+		},
+		{
+			name:      "pdb_of_a_covered_pod_is_deleted_rather_than_left_for_another_protecting_class",
+			wc:        notReadyWC,
+			validated: passed,
+			objects:   []client.Object{webWC(passed), coveredWebPod, testOwnedPDB(notReadyWC, coveredWebPod, closed), coveringPDB},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil, "user": {}},
+		},
+		{
+			name:      "pdb_of_a_covered_pod_is_not_taken_over",
+			wc:        webWC(passed),
+			validated: passed,
+			objects:   []client.Object{protectingWC, coveredWebPod, testOwnedPDB(notReadyWC, coveredWebPod, open), coveringPDB},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": {owner: "wc", maxUnavailable: "100%", leftAlone: true}, "user": {}},
+		},
+		{
+			name:      "validation_failed_deletes_the_pdb_of_a_covered_pod",
+			wc:        notReadyWC,
+			validated: failed,
+			objects: []client.Object{
+				coveredPod, testOwnedPDB(notReadyWC, coveredPod, closed), coveringPDB,
+				testPDBPod("web-2", nginx), testOwnedPDB(notReadyWC, testPDBPod("web-2", nginx), closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": nil,
+				"workload-web-2": {owner: "wc", maxUnavailable: "100%"},
+				"user":           {},
+			},
+		},
+		{
+			name:      "user_pdb_with_an_empty_selector_covers_every_pod",
+			wc:        notReadyWC,
+			validated: passed,
+			objects:   []client.Object{testPDBPod("web-1", nginx), testPDBPod("web-2", nginx), newUserPDB("user", &metav1.LabelSelector{})},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil, "workload-web-2": nil},
+			unlabeled: []string{"web-1", "web-2"},
+		},
+		{
+			name:      "user_pdb_with_a_nil_selector_covers_no_pod",
+			wc:        notReadyWC,
+			validated: passed,
+			objects:   []client.Object{testPDBPod("web-1", nginx), testPDBPod("web-2", nginx), newUserPDB("user", nil)},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc", maxUnavailable: "0"},
+				"workload-web-2": {owner: "wc", maxUnavailable: "0"},
 			},
 		},
 		{
@@ -2593,7 +2750,22 @@ func TestReconcilePDBs(t *testing.T) {
 					t.Errorf("Pod %s: labels = %v, want %s=%s", pod.Name, pod.Labels, workloadsv1alpha1.PodUIDLabel, pod.UID)
 				}
 			}
+			checkPodsUnlabeled(t, c, tc.unlabeled...)
 		})
+	}
+}
+
+// checkPodsUnlabeled checks that the Pods in namespace "ns" do not have the PodUIDLabel label.
+func checkPodsUnlabeled(t *testing.T, c client.Client, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		pod := &corev1.Pod{}
+		if err := c.Get(t.Context(), client.ObjectKey{Name: name, Namespace: "ns"}, pod); err != nil {
+			t.Fatalf("Pod %s: %v", name, err)
+		}
+		if v, ok := pod.Labels[workloadsv1alpha1.PodUIDLabel]; ok {
+			t.Errorf("Pod %s: label %s = %s, want it unset", name, workloadsv1alpha1.PodUIDLabel, v)
+		}
 	}
 }
 
@@ -2733,6 +2905,42 @@ func TestProtectionChangedPredicate(t *testing.T) {
 				t.Errorf("Update() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestUserPDBPredicate(t *testing.T) {
+	wc := testWorkloadClass("wc", "ns", nil)
+	wc.UID = "uid-wc"
+	pod := testPDBPod("web-1", nil)
+	managed := testOwnedPDB(wc, pod, intstr.FromInt32(0))
+	user := &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "user", Namespace: "ns", Generation: 1}}
+	userWithNewSpec := user.DeepCopy()
+	userWithNewSpec.Generation = 2
+	userWithNewStatus := user.DeepCopy()
+	userWithNewStatus.Status.DisruptionsAllowed = 1
+	unowned := managed.DeepCopy()
+	unowned.OwnerReferences = nil
+
+	p := userPDBPredicate()
+	testCases := []struct {
+		name string
+		got  bool
+		want bool
+	}{
+		{name: "create_user_pdb", got: p.Create(event.CreateEvent{Object: user}), want: true},
+		{name: "create_managed_pdb", got: p.Create(event.CreateEvent{Object: managed}), want: false},
+		{name: "delete_user_pdb", got: p.Delete(event.DeleteEvent{Object: user}), want: true},
+		{name: "delete_managed_pdb", got: p.Delete(event.DeleteEvent{Object: managed}), want: false},
+		{name: "user_pdb_spec_change", got: p.Update(event.UpdateEvent{ObjectOld: user, ObjectNew: userWithNewSpec}), want: true},
+		{name: "user_pdb_status_change", got: p.Update(event.UpdateEvent{ObjectOld: user, ObjectNew: userWithNewStatus}), want: false},
+		{name: "managed_pdb_change", got: p.Update(event.UpdateEvent{ObjectOld: managed, ObjectNew: managed}), want: false},
+		{name: "managed_pdb_loses_its_controller", got: p.Update(event.UpdateEvent{ObjectOld: managed, ObjectNew: unowned}), want: true},
+		{name: "generic", got: p.Generic(event.GenericEvent{Object: user}), want: false},
+	}
+	for _, tc := range testCases {
+		if tc.got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, tc.got, tc.want)
+		}
 	}
 }
 
