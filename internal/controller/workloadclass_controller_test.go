@@ -810,18 +810,6 @@ var _ = Describe("WorkloadClass Controller", func() {
 					g.Expect(cond.Message).To(ContainSubstring(msg))
 				}).Should(Succeed())
 			}
-			setEnforcedClass := func(name string) {
-				GinkgoHelper()
-				namespace := &corev1.Namespace{}
-				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ns}, namespace)).To(Succeed())
-				patch := client.MergeFrom(namespace.DeepCopy())
-				if name == "" {
-					delete(namespace.Labels, workloadsv1alpha1.EnforcedWorkloadClassLabel)
-				} else {
-					metav1.SetMetaDataLabel(&namespace.ObjectMeta, workloadsv1alpha1.EnforcedWorkloadClassLabel, name)
-				}
-				Expect(k8sClient.Patch(ctx, namespace, patch)).To(Succeed())
-			}
 			const bothPods = "2 selected Pods"
 
 			By("reporting SelectorOverlap on both WorkloadClasses without an enforced class")
@@ -829,22 +817,22 @@ var _ = Describe("WorkloadClass Controller", func() {
 			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
 
 			By("counting every Pod for the enforced class only, and not reporting overlap, once the label is set")
-			setEnforcedClass("wc-broad")
+			setNamespaceEnforcedClass(ns, "wc-broad")
 			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessNotReady, bothPods)
 			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessReady, "")
 
 			By("moving the Pods to the new enforced class when the label changes")
-			setEnforcedClass("wc-web")
+			setNamespaceEnforcedClass(ns, "wc-web")
 			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessReady, "")
 			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessNotReady, bothPods)
 
 			By("counting the Pods for no WorkloadClass when the label names a missing WorkloadClass")
-			setEnforcedClass("wc-missing")
+			setNamespaceEnforcedClass(ns, "wc-missing")
 			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessReady, "")
 			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonNoGuardrails, workloadsv1alpha1.ReadinessReady, "")
 
 			By("reporting SelectorOverlap again once the label is removed")
-			setEnforcedClass("")
+			setNamespaceEnforcedClass(ns, "")
 			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
 			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
 		})
@@ -1070,8 +1058,127 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Delete(ctx, userPDB)).To(Succeed())
 			eventuallyManagedPDBsFor("user-pdb-1", "user-pdb-2")
 		})
+
+		It("should hand the Per-Pod PDBs over to the namespace's enforced WorkloadClass and back", func() {
+			const ns = "wc-enforced-pdbs"
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.DeleteAllOf(ctx, &workloadsv1alpha1.WorkloadClass{}, client.InNamespace(ns))).To(Succeed())
+				deleteAllPods(ns)
+				Expect(k8sClient.DeleteAllOf(ctx, &policyv1.PodDisruptionBudget{}, client.InNamespace(ns))).To(Succeed())
+			})
+			Expect(k8sClient.Create(ctx, &workloadsv1alpha1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: guardrailName},
+				Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{Constraints: workloadsv1alpha1.Constraints{
+					Disruption: workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 10},
+				}},
+			})).To(Succeed())
+			// The window is never open during the test, so both WorkloadClasses are NotReady and their PDBs closed.
+			now := time.Now().UTC()
+			newWC := func(name, app string) *workloadsv1alpha1.WorkloadClass {
+				return &workloadsv1alpha1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+					Spec: workloadsv1alpha1.WorkloadClassSpec{
+						PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": app}},
+						DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{
+							MaxNonDisruptionDurationDays: 7,
+							AllowedDisruptionWindows: []workloadsv1alpha1.DisruptionWindow{{
+								Name:      "later",
+								TimeZone:  "UTC",
+								StartTime: now.Add(2 * time.Hour).Format("15:04"),
+								EndTime:   now.Add(3 * time.Hour).Format("15:04"),
+							}},
+						},
+					},
+				}
+			}
+			Expect(k8sClient.Create(ctx, newWC("wc-web", "web"))).To(Succeed())
+			enforced := newWC("wc-enforced", "other")
+			Expect(k8sClient.Create(ctx, enforced)).To(Succeed())
+			// No PodSelector selects plain.
+			for name, app := range map[string]string{"web-1": "web", "web-2": "web", "plain": "plain"} {
+				Expect(k8sClient.Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: map[string]string{"app": app}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+				})).To(Succeed())
+			}
+			// eventuallyPDBs waits until the managed PDBs in the namespace are exactly those of the Pods in owners, each
+			// controlled by the given WorkloadClass with the given maxUnavailable, and returns their UIDs by Pod name.
+			eventuallyPDBs := func(maxUnavailable string, owners map[string]string) map[string]types.UID {
+				GinkgoHelper()
+				var uids map[string]types.UID
+				Eventually(func(g Gomega) {
+					pdbs := &policyv1.PodDisruptionBudgetList{}
+					g.Expect(k8sClient.List(ctx, pdbs, client.InNamespace(ns))).To(Succeed())
+					got, gotUIDs := map[string]string{}, map[string]types.UID{}
+					for _, pdb := range pdbs.Items {
+						if owner := metav1.GetControllerOf(&pdb); owner != nil {
+							podName := utils.PodNameFromPDBName(pdb.Name)
+							got[podName], gotUIDs[podName] = owner.Name, pdb.UID
+							g.Expect(pdb.Spec.MaxUnavailable.String()).To(Equal(maxUnavailable), "PDB %s", pdb.Name)
+						}
+					}
+					g.Expect(got).To(Equal(owners))
+					uids = gotUIDs
+				}).Should(Succeed())
+				return uids
+			}
+			web := map[string]string{"web-1": "wc-web", "web-2": "wc-web"}
+			allEnforced := map[string]string{"web-1": "wc-enforced", "web-2": "wc-enforced", "plain": "wc-enforced"}
+
+			By("creating PDBs for the web Pods only, controlled by wc-web")
+			before := eventuallyPDBs("0", web)
+			// Wait for wc-enforced to protect Pods, so that wc-web hands its PDBs over rather than deleting them.
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(enforced), enforced)).To(Succeed())
+				g.Expect(statusProtectsPods(enforced)).To(BeTrue())
+			}).Should(Succeed())
+
+			By("handing the PDBs over to the enforced class, which also creates one for the Pod no PodSelector selects")
+			setNamespaceEnforcedClass(ns, "wc-enforced")
+			after := eventuallyPDBs("0", allEnforced)
+			Expect(after).To(HaveKeyWithValue("web-1", before["web-1"]))
+			Expect(after).To(HaveKeyWithValue("web-2", before["web-2"]))
+
+			By("opening the PDBs, which wc-web does not take back, when the enforced class fails validation")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(enforced), enforced)).To(Succeed())
+			enforced.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 20
+			Expect(k8sClient.Update(ctx, enforced)).To(Succeed())
+			eventuallyPDBs("100%", allEnforced)
+
+			By("closing the PDBs again when the enforced class passes validation")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(enforced), enforced)).To(Succeed())
+			enforced.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays = 7
+			Expect(k8sClient.Update(ctx, enforced)).To(Succeed())
+			before = eventuallyPDBs("0", allEnforced)
+
+			By("handing the PDBs of the web Pods back to wc-web and deleting the other one when the label is removed")
+			setNamespaceEnforcedClass(ns, "")
+			after = eventuallyPDBs("0", web)
+			Expect(after).To(HaveKeyWithValue("web-1", before["web-1"]))
+			Expect(after).To(HaveKeyWithValue("web-2", before["web-2"]))
+
+			By("deleting every PDB when the label names a missing WorkloadClass")
+			setNamespaceEnforcedClass(ns, "wc-missing")
+			eventuallyPDBs("0", map[string]string{})
+		})
 	})
 })
+
+// setNamespaceEnforcedClass sets the workloads.x-k8s.io/enforced-class label of the Namespace to name, or removes it if
+// name is empty.
+func setNamespaceEnforcedClass(ns, name string) {
+	GinkgoHelper()
+	namespace := &corev1.Namespace{}
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ns}, namespace)).To(Succeed())
+	patch := client.MergeFrom(namespace.DeepCopy())
+	if name == "" {
+		delete(namespace.Labels, workloadsv1alpha1.EnforcedWorkloadClassLabel)
+	} else {
+		metav1.SetMetaDataLabel(&namespace.ObjectMeta, workloadsv1alpha1.EnforcedWorkloadClassLabel, name)
+	}
+	Expect(k8sClient.Patch(ctx, namespace, patch)).To(Succeed())
+}
 
 // deleteAllPods removes the finalizers of every Pod in the namespace and deletes the Pods immediately.
 func deleteAllPods(namespace string) {
@@ -2435,6 +2542,20 @@ func TestReconcilePDBs(t *testing.T) {
 	// recreated replaced a Pod with the same name (e.g. a StatefulSet Pod), so its PDB still selects the old UID.
 	recreated := testPDBPod("web-0", nginx)
 	recreated.UID = "uid-web-0-recreated"
+	// wc-enforced is the enforced WorkloadClass of enforcingNS. Its PodSelector (other, unless nil) selects none of the
+	// Pods, and redisPod matches no WorkloadClass, but wc-enforced governs every Pod in the namespace while it is enforced.
+	enforcingNS := testEnforcingNamespace("ns", "wc-enforced")
+	redisPod := testPDBPod("redis", map[string]string{"app": "redis"})
+	other := &metav1.LabelSelector{MatchLabels: map[string]string{"app": "other"}}
+	enforcedWC := func(cond metav1.Condition, selector *metav1.LabelSelector) *workloadsv1alpha1.WorkloadClass {
+		wc := newWC("wc-enforced", workloadsv1alpha1.ReadinessNotReady)
+		wc.Spec.PodSelector = selector
+		wc.Status.Conditions = []metav1.Condition{cond}
+		return wc
+	}
+	deletingEnforcedWC := enforcedWC(passed, other)
+	deletingEnforcedWC.DeletionTimestamp = ptr.To(metav1.Now())
+	deletingEnforcedWC.Finalizers = []string{"workloads.x-k8s.io/test"}
 
 	// wantPDB is the expected controller and maxUnavailable of a PDB. An empty owner means a PDB that is not managed
 	// by a WorkloadClass and must be left untouched. leftAlone means a PDB that the reconciled WorkloadClass controls
@@ -2687,6 +2808,148 @@ func TestReconcilePDBs(t *testing.T) {
 			objects:   []client.Object{testPDBPod("web-1", nginx)},
 			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil},
 		},
+		{
+			name:      "enforced_class_governs_every_pod_and_takes_over_the_pdbs_of_other_classes",
+			wc:        enforcedWC(passed, other),
+			validated: passed,
+			objects: []client.Object{
+				enforcingNS, enforcedWC(passed, other), protectingWC, testPDBPod("web-1", nginx), redisPod,
+				testOwnedPDB(protectingWC, testPDBPod("web-1", nginx), open),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc-enforced", maxUnavailable: "0"},
+				"workload-redis": {owner: "wc-enforced", maxUnavailable: "0"},
+			},
+		},
+		{
+			name:      "enforced_class_with_a_nil_selector_governs_every_pod",
+			wc:        enforcedWC(passed, nil),
+			validated: passed,
+			objects:   []client.Object{enforcingNS, enforcedWC(passed, nil), testPDBPod("web-1", nginx), redisPod},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc-enforced", maxUnavailable: "0"},
+				"workload-redis": {owner: "wc-enforced", maxUnavailable: "0"},
+			},
+		},
+		{
+			name:      "other_class_governs_no_pod_and_leaves_its_pdbs_for_the_enforced_class",
+			wc:        notReadyWC,
+			validated: passed,
+			objects: []client.Object{
+				enforcingNS, enforcedWC(passed, other), testPDBPod("web-1", nginx), testPDBPod("web-2", nginx), redisPod,
+				testOwnedPDB(notReadyWC, testPDBPod("web-1", nginx), closed),
+				testOwnedPDB(enforcedWC(passed, other), redisPod, closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc", maxUnavailable: "0", leftAlone: true},
+				"workload-web-2": nil,
+				"workload-redis": {owner: "wc-enforced", maxUnavailable: "0", leftAlone: true},
+			},
+			unlabeled: []string{"web-1", "web-2"},
+		},
+		{
+			name:      "other_class_that_does_not_protect_leaves_its_pdbs_for_the_enforced_class",
+			wc:        notReadyWC,
+			validated: failed,
+			objects: []client.Object{
+				enforcingNS, enforcedWC(passed, other), testPDBPod("web-1", nginx),
+				testOwnedPDB(notReadyWC, testPDBPod("web-1", nginx), closed),
+			},
+			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: "wc", maxUnavailable: "0", leftAlone: true}},
+		},
+		{
+			name:      "pdb_is_deleted_when_the_enforced_class_does_not_protect",
+			wc:        notReadyWC,
+			validated: passed,
+			objects: []client.Object{
+				enforcingNS, enforcedWC(failed, other), testPDBPod("web-1", nginx),
+				testOwnedPDB(notReadyWC, testPDBPod("web-1", nginx), closed),
+			},
+			wantPDBs: map[string]*wantPDB{"workload-web-1": nil},
+		},
+		{
+			name:      "enforced_class_that_does_not_protect_opens_its_pdbs_and_creates_none",
+			wc:        enforcedWC(failed, other),
+			validated: failed,
+			objects: []client.Object{
+				enforcingNS, enforcedWC(failed, other), redisPod, testPDBPod("web-2", nginx),
+				testOwnedPDB(enforcedWC(failed, other), redisPod, closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-redis": {owner: "wc-enforced", maxUnavailable: "100%"},
+				"workload-web-2": nil,
+			},
+		},
+		{
+			name:      "missing_enforced_class_leaves_pods_ungoverned_without_falling_back_to_selectors",
+			wc:        notReadyWC,
+			validated: passed,
+			objects: []client.Object{
+				testEnforcingNamespace("ns", "wc-missing"), testPDBPod("web-1", nginx), testPDBPod("web-2", nginx),
+				testOwnedPDB(notReadyWC, testPDBPod("web-1", nginx), closed),
+			},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil, "workload-web-2": nil},
+			unlabeled: []string{"web-1", "web-2"},
+		},
+		{
+			name:      "deleting_enforced_class_leaves_pods_ungoverned_without_falling_back_to_selectors",
+			wc:        notReadyWC,
+			validated: passed,
+			objects: []client.Object{
+				enforcingNS, deletingEnforcedWC, testPDBPod("web-1", nginx), testPDBPod("web-2", nginx),
+				testOwnedPDB(notReadyWC, testPDBPod("web-1", nginx), closed),
+			},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil, "workload-web-2": nil},
+			unlabeled: []string{"web-1", "web-2"},
+		},
+		{
+			name:      "enforced_class_skips_pods_covered_by_a_user_pdb",
+			wc:        enforcedWC(passed, other),
+			validated: passed,
+			objects: []client.Object{
+				enforcingNS, enforcedWC(passed, other), coveredPod, coveringPDB, testPDBPod("web-2", nginx),
+				testOwnedPDB(enforcedWC(passed, other), coveredPod, closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": nil,
+				"workload-web-2": {owner: "wc-enforced", maxUnavailable: "0"},
+				"user":           {},
+			},
+			unlabeled: []string{"web-1"},
+		},
+		{
+			name:      "pdb_of_a_covered_pod_is_deleted_rather_than_left_for_the_enforced_class",
+			wc:        notReadyWC,
+			validated: passed,
+			objects: []client.Object{
+				enforcingNS, enforcedWC(passed, other), coveredPod, coveringPDB, testOwnedPDB(notReadyWC, coveredPod, closed),
+			},
+			wantPDBs: map[string]*wantPDB{"workload-web-1": nil, "user": {}},
+		},
+		{
+			name:      "formerly_enforced_class_hands_the_pdbs_back_to_the_selector_best_match",
+			wc:        enforcedWC(passed, other),
+			validated: passed,
+			objects: []client.Object{
+				enforcedWC(passed, other), protectingWC, testPDBPod("web-1", nginx), redisPod,
+				testOwnedPDB(enforcedWC(passed, other), testPDBPod("web-1", nginx), closed),
+				testOwnedPDB(enforcedWC(passed, other), redisPod, closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc-enforced", maxUnavailable: "0", leftAlone: true},
+				"workload-redis": nil,
+			},
+		},
+		{
+			name:      "selector_best_match_takes_the_pdb_back_from_the_formerly_enforced_class",
+			wc:        notReadyWC,
+			validated: passed,
+			objects: []client.Object{
+				enforcedWC(passed, other), testPDBPod("web-1", nginx),
+				testOwnedPDB(enforcedWC(passed, other), testPDBPod("web-1", nginx), closed),
+			},
+			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: "wc", maxUnavailable: "0"}},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2847,6 +3110,7 @@ func TestWorkloadClassesForPod(t *testing.T) {
 
 	testCases := []struct {
 		name string
+		ns   *corev1.Namespace
 		pdb  *policyv1.PodDisruptionBudget
 		want []string
 	}{
@@ -2854,11 +3118,26 @@ func TestWorkloadClassesForPod(t *testing.T) {
 		{name: "pdb_of_a_selecting_class", pdb: testOwnedPDB(selecting, pod, intstr.FromInt32(0)), want: []string{"ns/wc-nginx"}},
 		{name: "pdb_of_another_class", pdb: testOwnedPDB(previous, pod, intstr.FromInt32(0)), want: []string{"ns/wc-nginx", "ns/wc-previous"}},
 		{name: "user_pdb_with_the_same_name", pdb: utils.PDBBase(pod), want: []string{"ns/wc-nginx"}},
+		{
+			name: "enforced_class_and_the_class_that_still_controls_the_pdb",
+			ns:   testEnforcingNamespace("ns", "wc-previous"),
+			pdb:  testOwnedPDB(selecting, pod, intstr.FromInt32(0)),
+			want: []string{"ns/wc-nginx", "ns/wc-previous"},
+		},
+		{
+			name: "missing_enforced_class_and_the_class_that_still_controls_the_pdb",
+			ns:   testEnforcingNamespace("ns", "wc-missing"),
+			pdb:  testOwnedPDB(selecting, pod, intstr.FromInt32(0)),
+			want: []string{"ns/wc-nginx"},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := newTestScheme(t)
 			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(selecting, previous)
+			if tc.ns != nil {
+				builder = builder.WithObjects(tc.ns)
+			}
 			if tc.pdb != nil {
 				builder = builder.WithObjects(tc.pdb)
 			}

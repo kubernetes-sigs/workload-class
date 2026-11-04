@@ -582,6 +582,13 @@ func statusProtectsPods(wc *workloadsv1alpha1.WorkloadClass) bool {
 // name is taken by a user-created PDB that does not cover it is skipped as well, since claimPDB refuses to modify that
 // PDB; it is retried when that PDB changes.
 //
+// In a Namespace with the workloads.x-k8s.io/enforced-class label, the enforced WorkloadClass governs every Pod in the
+// namespace, whether or not its PodSelector selects them, so it takes over the PDBs of the other WorkloadClasses (see
+// claimPDB), which govern no Pods and leave their PDBs to it. If the label names a WorkloadClass that does not exist or
+// is being deleted, no WorkloadClass governs the Pods, so their PDBs are deleted (or opened by a WorkloadClass that
+// does not protect Pods). Governance does not depend on protection: an enforced WorkloadClass that does not protect
+// Pods still governs them, so it opens its own PDBs and the other WorkloadClasses delete theirs.
+//
 // A WorkloadClass that is being deleted is skipped, since its PDBs are garbage collected through their owner
 // references. An error for one Pod does not stop the others; all errors are returned.
 func (r *WorkloadClassReconciler) reconcilePDBs(
