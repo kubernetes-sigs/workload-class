@@ -17,7 +17,9 @@ limitations under the License.
 package utils
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -28,102 +30,125 @@ import (
 )
 
 const (
+	// PDBNamePrefix is the prefix of the name of every PodDisruptionBudget managed by a WorkloadClass.
 	PDBNamePrefix = "workload-"
+
+	// MaxPDBNameLength is the maximum length of a PodDisruptionBudget name (a DNS-1123 subdomain).
+	MaxPDBNameLength = 253
+
+	// pdbNameHashLength is the number of bytes of the SHA-256 hash of the Pod name that are hex-encoded and appended
+	// to a truncated PodDisruptionBudget name.
+	pdbNameHashLength = 4
 
 	openValue   = "100%" // Allows 100% of Pods to be unavailable
 	closedValue = 0      // Allows 0 Pods to be unavailable
 )
 
-// PDBName returns the name of the PDB based on the WorkloadClass name.
-// PDBs made for WorkloadClasses will have the prefix `workload-`.
-func PDBName(wcName string) string {
-	return PDBNamePrefix + wcName
+// PDBName returns the name of the PodDisruptionBudget of a Pod governed by a WorkloadClass: the Pod name with the
+// prefix `workload-`.
+//
+// If the prefixed name exceeds MaxPDBNameLength, it is truncated and suffixed with a hyphen and the first 8 hex
+// characters of the SHA-256 hash of the Pod name, so that the name stays unique and deterministic.
+func PDBName(podName string) string {
+	name := PDBNamePrefix + podName
+	if len(name) <= MaxPDBNameLength {
+		return name
+	}
+	sum := sha256.Sum256([]byte(podName))
+	suffix := fmt.Sprintf("-%x", sum[:pdbNameHashLength])
+	// A DNS-1123 subdomain must end with an alphanumeric character, so trim separators left by the truncation.
+	prefix := strings.TrimRight(name[:MaxPDBNameLength-len(suffix)], "-.")
+	return prefix + suffix
 }
 
-// PDBBase returns a basic PDB, configured based on the WorkloadClass.
-func PDBBase(wc *workloadsv1alpha1.WorkloadClass) *policyv1.PodDisruptionBudget {
-	if wc == nil {
+// PodNameFromPDBName returns the name of the Pod that a PodDisruptionBudget managed by a WorkloadClass was created
+// for, by removing the `workload-` prefix.
+//
+// The result is not the Pod name if PDBName truncated the name; callers can detect that case by the PDB name being
+// MaxPDBNameLength characters long and compare PDBName(pod.Name) against the PDB name instead.
+func PodNameFromPDBName(pdbName string) string {
+	return strings.TrimPrefix(pdbName, PDBNamePrefix)
+}
+
+// PDBBase returns a base PodDisruptionBudget for the Pod: its name (see PDBName), the Pod's namespace, and the
+// PodUIDLabel label set to the Pod's UID. It returns nil if the Pod is nil.
+func PDBBase(pod *corev1.Pod) *policyv1.PodDisruptionBudget {
+	if pod == nil {
 		return nil
 	}
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      PDBName(wc.Name),
-			Namespace: wc.Namespace,
+			Name:      PDBName(pod.Name),
+			Namespace: pod.Namespace,
+			Labels: map[string]string{
+				workloadsv1alpha1.PodUIDLabel: string(pod.UID),
+			},
 		},
 	}
 }
 
-// IsEnforcedWorkloadClass reports whether ns enforces wc across all Pods in the namespace
-// via the workloads.x-k8s.io/enforced-class label.
-func IsEnforcedWorkloadClass(ns *corev1.Namespace, wc *workloadsv1alpha1.WorkloadClass) bool {
-	if ns == nil || wc == nil || !wc.DeletionTimestamp.IsZero() {
-		return false
-	}
-	return ns.Labels[workloadsv1alpha1.EnforcedWorkloadClassLabel] == wc.Name
-}
-
-// SyncPDBWithWorkloadClass configures the PDB to match the WorkloadClass' disruption policy.
+// SyncPDBWithWorkloadClass configures the PodDisruptionBudget of a single Pod to match the disruption policy of the
+// WorkloadClass that governs the Pod.
 //
-// When enforced is true (i.e. the Namespace's workloads.x-k8s.io/enforced-class label names wc),
-// the enforced WorkloadClass overrides PodSelector matching and applies to every Pod in the namespace,
-// so pdb.Spec.Selector is set to an empty LabelSelector (&metav1.LabelSelector{}) to match all Pods
-// in the namespace. Under an enforced-class Namespace, the controller must only maintain a PDB for
-// the enforced WorkloadClass and delete managed PDBs for all other WorkloadClasses in that namespace
-// so that no Pod is covered by multiple class PDBs.
+// The PDB selects only the PodUIDLabel label with the Pod's UID, so it covers exactly this Pod. Because each Pod has
+// its own PDB, a Pod is never covered by more than one WorkloadClass-managed PDB, which the eviction API rejects.
 //
-// Otherwise, pdb.Spec.Selector is a copy of wc.Spec.PodSelector (which in policy/v1 matches no Pods
-// when nil); overlapping PodSelectors across WorkloadClasses in the same namespace fail validation
-// (ReasonSelectorOverlap) so their PDBs are not active simultaneously.
-func SyncPDBWithWorkloadClass(wc *workloadsv1alpha1.WorkloadClass, pdb *policyv1.PodDisruptionBudget, enforced ...bool) error {
+// protects reports whether the WorkloadClass currently protects the Pods it governs; the caller decides it from the
+// WorkloadClass' Validated condition. If protects is false (e.g. the WorkloadClass failed validation), the PDB is
+// opened (MaxUnavailable = 100%) so that it does not block evictions. Otherwise, MaxUnavailable follows the
+// WorkloadClass' MaintenanceReadiness:
+//   - Ready or Overdue: 100% (disruptions are allowed).
+//   - NotReady, or any other value including unset: 0 (disruptions are blocked), so that the PDB fails safe before
+//     the controller has calculated readiness or when readiness cannot be determined.
+//
+// UnhealthyPodEvictionPolicy is AlwaysAllow, so that a Pod that is not Ready (e.g. in CrashLoopBackOff) does not hold
+// up node drains or upgrades while MaxUnavailable is 0.
+func SyncPDBWithWorkloadClass(
+	wc *workloadsv1alpha1.WorkloadClass, pod *corev1.Pod, pdb *policyv1.PodDisruptionBudget, protects bool,
+) error {
 	if wc == nil {
 		return fmt.Errorf("failed to sync PDB with WorkloadClass, WorkloadClass is nil")
 	}
-
+	if pod == nil {
+		return fmt.Errorf("failed to sync PDB with WorkloadClass, Pod is nil")
+	}
 	if pdb == nil {
 		return fmt.Errorf("failed to sync PDB with WorkloadClass, PDB is nil")
 	}
 
 	if pdb.Name == "" {
-		pdb.Name = PDBName(wc.Name)
+		pdb.Name = PDBName(pod.Name)
 	}
 	if pdb.Namespace == "" {
-		pdb.Namespace = wc.Namespace
+		pdb.Namespace = pod.Namespace
+	}
+	if pdb.Labels == nil {
+		pdb.Labels = map[string]string{}
+	}
+	pdb.Labels[workloadsv1alpha1.PodUIDLabel] = string(pod.UID)
+
+	pdb.Spec.Selector = &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			workloadsv1alpha1.PodUIDLabel: string(pod.UID),
+		},
 	}
 
-	if len(enforced) > 0 && enforced[0] {
-		pdb.Spec.Selector = &metav1.LabelSelector{}
-	} else {
-		pdb.Spec.Selector = wc.Spec.PodSelector.DeepCopy()
-	}
-
-	// AlwaysAllow allows evicting unhealthy (unready) Pods even when maxUnavailable is 0
-	// so broken Pods (e.g. in CrashLoopBackOff) do not hold up node drains or upgrades.
 	policy := policyv1.AlwaysAllow
 	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
 
 	open := intstr.FromString(openValue)
 	closed := intstr.FromInt32(closedValue)
 
-	// If the WorkloadClass failed validation, do not block evictions via the PDB.
-	for _, cond := range wc.Status.Conditions {
-		if cond.Type == workloadsv1alpha1.ConditionTypeValidated && cond.Status == metav1.ConditionFalse {
-			pdb.Spec.MaxUnavailable = &open
-			return nil
-		}
+	if !protects {
+		pdb.Spec.MaxUnavailable = &open
+		return nil
 	}
 
-	maxUnavailableMap := map[workloadsv1alpha1.MaintenanceReadiness]*intstr.IntOrString{
-		workloadsv1alpha1.ReadinessReady:    &open,
-		workloadsv1alpha1.ReadinessNotReady: &closed,
-		workloadsv1alpha1.ReadinessOverdue:  &open,
-	}
-
-	// Set MaxUnavailable based on the WorkloadClass' MaintenanceReadiness
-	if val, ok := maxUnavailableMap[wc.Status.MaintenanceReadiness]; ok {
-		pdb.Spec.MaxUnavailable = val
-	} else {
+	switch wc.Status.MaintenanceReadiness {
+	case workloadsv1alpha1.ReadinessReady, workloadsv1alpha1.ReadinessOverdue:
+		pdb.Spec.MaxUnavailable = &open
+	default:
 		pdb.Spec.MaxUnavailable = &closed
 	}
-
 	return nil
 }
