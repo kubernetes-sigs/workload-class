@@ -74,6 +74,11 @@ func IsEnforcedWorkloadClass(ns *corev1.Namespace, wc *workloadsv1alpha1.Workloa
 // Otherwise, pdb.Spec.Selector is a copy of wc.Spec.PodSelector (which in policy/v1 matches no Pods
 // when nil); overlapping PodSelectors across WorkloadClasses in the same namespace fail validation
 // (ReasonSelectorOverlap) so their PDBs are not active simultaneously.
+//
+// In both modes, if a user-managed PodDisruptionBudget in the namespace overlaps the WorkloadClass's
+// selected Pods (including any user PDB in an enforced-class namespace), the controller skips creating
+// (or deletes) the managed class PDB and relies on DisruptionWebhook enforcement so that no Pod is
+// covered by more than one PDB.
 func SyncPDBWithWorkloadClass(wc *workloadsv1alpha1.WorkloadClass, pdb *policyv1.PodDisruptionBudget, enforced ...bool) error {
 	if wc == nil {
 		return fmt.Errorf("failed to sync PDB with WorkloadClass, WorkloadClass is nil")
