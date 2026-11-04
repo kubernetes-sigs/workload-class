@@ -7,15 +7,35 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
+  - namespaces
   verbs:
-  - create
-  - patch
+  - get
+  - list
+  - watch
 - apiGroups:
   - ""
   resources:
-  - namespaces
   - pods
+  verbs:
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - workloads.x-k8s.io
+  resources:
+  - workloadclasses
   verbs:
   - get
   - list
@@ -23,7 +43,15 @@ rules:
 - apiGroups:
   - workloads.x-k8s.io
   resources:
-  - workloadclasses
+  - workloadclasses/status
+  - workloadclassguardrails/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - workloads.x-k8s.io
+  resources:
   - workloadclassguardrails
   verbs:
   - create
@@ -36,16 +64,6 @@ rules:
 - apiGroups:
   - workloads.x-k8s.io
   resources:
-  - workloadclasses/finalizers
   - workloadclassguardrails/finalizers
   verbs:
-  - update
-- apiGroups:
-  - workloads.x-k8s.io
-  resources:
-  - workloadclasses/status
-  - workloadclassguardrails/status
-  verbs:
-  - get
-  - patch
   - update
