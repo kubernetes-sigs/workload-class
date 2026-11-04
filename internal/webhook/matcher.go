@@ -23,13 +23,12 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	workloadsv1alpha1 "sigs.k8s.io/workload-class/api/v1alpha1"
+	"sigs.k8s.io/workload-class/internal/utils"
 )
 
 // bestMatchWorkloadClass finds the most suitable WorkloadClass for a given Pod.
@@ -44,6 +43,9 @@ import (
 // If two or more WorkloadClasses match in specificity to the Pod, the oldest
 // WorkloadClass takes precedence (breaking ties on equal CreationTimestamp by Name).
 //
+// The selection rules are shared with the WorkloadClass controller (see utils.SelectorBestMatch), so that the
+// WorkloadClass enforced here is the one that owns the Pod's PodDisruptionBudget.
+//
 // If no matching or active enforced WorkloadClass is found, it returns nil.
 func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admission.Request, pod *corev1.Pod) (bestMatch *workloadsv1alpha1.WorkloadClass, err error) {
 	// If the namespace defines an enforced WorkloadClass, it overrides PodSelector matching for the namespace.
@@ -56,22 +58,7 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, req admi
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %w", err)
 	}
 
-	// Keep track of all other matches to emit a warning message
-	otherMatches := map[string]int{}
-	maxSpecificity := -1
-
-	for _, wc := range wcs.Items {
-		if !wc.DeletionTimestamp.IsZero() {
-			continue
-		}
-		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
-		if err != nil {
-			continue
-		}
-		if selector.Matches(labels.Set(pod.Labels)) {
-			bestMatch, otherMatches = updateBestMatch(&wc, bestMatch, &maxSpecificity, otherMatches)
-		}
-	}
+	bestMatch, otherMatches, maxSpecificity := utils.SelectorBestMatch(pod, wcs.Items)
 
 	// Emit warning message for WorkloadClasses that matched, but are ignored
 	v.emitWarning(ctx, req, pod, bestMatch, otherMatches, maxSpecificity)
@@ -111,42 +98,16 @@ func (v *DisruptionWebhook) emitWarning(ctx context.Context, req admission.Reque
 	}
 }
 
-func updateBestMatch(wc, bestMatch *workloadsv1alpha1.WorkloadClass, maxSpecificity *int, otherMatches map[string]int) (*workloadsv1alpha1.WorkloadClass, map[string]int) {
-	spec := getSpecificity(wc.Spec.PodSelector)
-	equalSpecHigherPriority := bestMatch != nil && spec == *maxSpecificity &&
-		(wc.CreationTimestamp.Before(&bestMatch.CreationTimestamp) ||
-			(wc.CreationTimestamp.Equal(&bestMatch.CreationTimestamp) && wc.Name < bestMatch.Name))
-	if bestMatch == nil || spec > *maxSpecificity || equalSpecHigherPriority {
-		if bestMatch != nil {
-			otherMatches[fmt.Sprintf("%s/%s", bestMatch.Namespace, bestMatch.Name)] = *maxSpecificity
-		}
-		*maxSpecificity = spec
-		return wc, otherMatches
-	}
-	// This WC still matched the Pod, track it for logging
-	otherMatches[fmt.Sprintf("%s/%s", wc.Namespace, wc.Name)] = spec
-	return bestMatch, otherMatches
-}
-
-func getSpecificity(sel *metav1.LabelSelector) int {
-	if sel == nil {
-		return 0
-	}
-	return len(sel.MatchLabels) + len(sel.MatchExpressions)
-}
-
+// namespaceDefaultWorkloadClass returns the WorkloadClass enforced by the Pod's Namespace (see
+// utils.NamespaceEnforcedWorkloadClass) and whether the Namespace enforces one.
+//
+// Errors are logged rather than returned: if the Namespace cannot be read, PodSelector matching is used; if the
+// enforced WorkloadClass cannot be read, no WorkloadClass applies to the Pod.
 func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod) (*workloadsv1alpha1.WorkloadClass, bool) {
-	ns := &corev1.Namespace{}
-	if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil {
-		if defaultClass := ns.Labels[workloadsv1alpha1.EnforcedWorkloadClassLabel]; defaultClass != "" {
-			wc := &workloadsv1alpha1.WorkloadClass{}
-			if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass, Namespace: pod.Namespace}, wc); err != nil {
-				logf.FromContext(ctx).Error(err, "Failed to get namespace enforced WorkloadClass", "namespace", pod.Namespace, "workloadClass", defaultClass)
-			} else if wc.DeletionTimestamp.IsZero() {
-				return wc, true
-			}
-			return nil, true
-		}
+	wc, enforced, err := utils.NamespaceEnforcedWorkloadClass(ctx, v.Client, pod.Namespace)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to get namespace enforced WorkloadClass", "namespace", pod.Namespace)
+		return nil, enforced
 	}
-	return nil, false
+	return wc, enforced
 }
