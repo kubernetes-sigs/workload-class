@@ -20,6 +20,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -29,11 +30,13 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
@@ -47,6 +50,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	workloadsv1alpha1 "sigs.k8s.io/workload-class/api/v1alpha1"
+	"sigs.k8s.io/workload-class/internal/utils"
 )
 
 var _ = Describe("WorkloadClass Controller", func() {
@@ -576,6 +580,8 @@ var _ = Describe("WorkloadClass Controller", func() {
 
 			Expect(k8sClient.DeleteAllOf(ctx, &workloadsv1alpha1.WorkloadClass{}, client.InNamespace(namespace))).To(Succeed())
 			deleteAllPods(namespace)
+			// envtest runs no garbage collector, so the PDBs of the deleted WorkloadClasses are deleted explicitly.
+			Expect(k8sClient.DeleteAllOf(ctx, &policyv1.PodDisruptionBudget{}, client.InNamespace(namespace))).To(Succeed())
 			g := &workloadsv1alpha1.WorkloadClassGuardrail{ObjectMeta: metav1.ObjectMeta{Name: guardrailName}}
 			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, g))).To(Succeed())
 		})
@@ -842,6 +848,108 @@ var _ = Describe("WorkloadClass Controller", func() {
 			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
 			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
 		})
+
+		It("should create, update, and restore the Per-Pod PDBs of a valid WorkloadClass, and open them when it fails validation", func() {
+			const wcName = "wc-pdbs"
+			key := types.NamespacedName{Name: wcName, Namespace: namespace}
+			podLabels := map[string]string{"app": "pdbs"}
+			Expect(k8sClient.Create(ctx, &workloadsv1alpha1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: guardrailName},
+				Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{Constraints: workloadsv1alpha1.Constraints{
+					Disruption: workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 10},
+				}},
+			})).To(Succeed())
+			// The window is never open during the test, so the WorkloadClass is NotReady.
+			now := time.Now().UTC()
+			laterWindow := []workloadsv1alpha1.DisruptionWindow{{
+				Name:      "later",
+				TimeZone:  "UTC",
+				StartTime: now.Add(2 * time.Hour).Format("15:04"),
+				EndTime:   now.Add(3 * time.Hour).Format("15:04"),
+			}}
+			Expect(k8sClient.Create(ctx, &workloadsv1alpha1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: wcName, Namespace: namespace},
+				Spec: workloadsv1alpha1.WorkloadClassSpec{
+					PodSelector: &metav1.LabelSelector{MatchLabels: podLabels},
+					DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{
+						MaxNonDisruptionDurationDays: 7,
+						AllowedDisruptionWindows:     laterWindow,
+					},
+				},
+			})).To(Succeed())
+			for _, name := range []string{"pdbs-1", "pdbs-2"} {
+				Expect(k8sClient.Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: podLabels},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+				})).To(Succeed())
+			}
+
+			pdbKey := func(podName string) types.NamespacedName {
+				return types.NamespacedName{Name: utils.PDBName(podName), Namespace: namespace}
+			}
+			eventuallyPDBs := func(maxUnavailable string) {
+				GinkgoHelper()
+				wc := &workloadsv1alpha1.WorkloadClass{}
+				Expect(k8sClient.Get(ctx, key, wc)).To(Succeed())
+				Eventually(func(g Gomega) {
+					for _, podName := range []string{"pdbs-1", "pdbs-2"} {
+						pod := &corev1.Pod{}
+						g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, pod)).To(Succeed())
+						g.Expect(pod.Labels).To(HaveKeyWithValue(workloadsv1alpha1.PodUIDLabel, string(pod.UID)))
+
+						pdb := &policyv1.PodDisruptionBudget{}
+						g.Expect(k8sClient.Get(ctx, pdbKey(podName), pdb)).To(Succeed())
+						owner := metav1.GetControllerOf(pdb)
+						g.Expect(owner).NotTo(BeNil())
+						g.Expect(owner.UID).To(Equal(wc.UID))
+						g.Expect(owner.BlockOwnerDeletion).To(HaveValue(BeTrue()))
+						g.Expect(pdb.Spec.Selector.MatchLabels).To(Equal(map[string]string{workloadsv1alpha1.PodUIDLabel: string(pod.UID)}))
+						g.Expect(pdb.Spec.UnhealthyPodEvictionPolicy).To(HaveValue(Equal(policyv1.AlwaysAllow)))
+						g.Expect(pdb.Spec.MaxUnavailable.String()).To(Equal(maxUnavailable))
+					}
+				}).Should(Succeed())
+			}
+			updatePolicy := func(mutate func(*workloadsv1alpha1.DisruptionPolicy)) {
+				GinkgoHelper()
+				wc := &workloadsv1alpha1.WorkloadClass{}
+				Expect(k8sClient.Get(ctx, key, wc)).To(Succeed())
+				mutate(&wc.Spec.DisruptionPolicy)
+				Expect(k8sClient.Update(ctx, wc)).To(Succeed())
+			}
+
+			By("labeling the Pods and creating closed PDBs while the WorkloadClass is NotReady")
+			eventuallyPDBs("0")
+
+			By("restoring a deleted PDB")
+			deleted := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, pdbKey("pdbs-1"), deleted)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, deleted)).To(Succeed())
+			Eventually(func(g Gomega) {
+				restored := &policyv1.PodDisruptionBudget{}
+				g.Expect(k8sClient.Get(ctx, pdbKey("pdbs-1"), restored)).To(Succeed())
+				g.Expect(restored.UID).NotTo(Equal(deleted.UID))
+			}).Should(Succeed())
+
+			By("restoring an edited PDB")
+			edited := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, pdbKey("pdbs-2"), edited)).To(Succeed())
+			edited.Spec.MaxUnavailable = ptr.To(intstr.FromString("100%"))
+			Expect(k8sClient.Update(ctx, edited)).To(Succeed())
+			eventuallyPDBs("0")
+
+			By("opening the PDBs when the WorkloadClass becomes Ready because its window changes")
+			updatePolicy(func(p *workloadsv1alpha1.DisruptionPolicy) { p.AllowedDisruptionWindows = nil })
+			eventuallyPDBs("100%")
+
+			By("closing the PDBs when the WorkloadClass becomes NotReady again")
+			updatePolicy(func(p *workloadsv1alpha1.DisruptionPolicy) { p.AllowedDisruptionWindows = laterWindow })
+			eventuallyPDBs("0")
+
+			By("opening the PDBs when the WorkloadClass fails validation")
+			updatePolicy(func(p *workloadsv1alpha1.DisruptionPolicy) { p.MaxNonDisruptionDurationDays = 20 })
+			eventuallyCondition(wcName, metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
+			eventuallyPDBs("100%")
+		})
 	})
 })
 
@@ -869,6 +977,7 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(workloadsv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(policyv1.AddToScheme(scheme))
 	return scheme
 }
 
@@ -2077,6 +2186,240 @@ func TestPodReadinessPredicate(t *testing.T) {
 	}
 	if p.Generic(event.GenericEvent{Object: base}) {
 		t.Error("Generic() = true, want false")
+	}
+
+	const podUID = "uid-pod"
+	withLabels := func(podLabels map[string]string) *corev1.Pod {
+		return withChange(func(p *corev1.Pod) {
+			p.UID = podUID
+			p.Labels = podLabels
+		})
+	}
+	unlabeled := withLabels(map[string]string{"app": "nginx"})
+	labeled := withLabels(map[string]string{"app": "nginx", workloadsv1alpha1.PodUIDLabel: podUID})
+	podUIDCases := []struct {
+		name           string
+		oldPod, newPod *corev1.Pod
+		want           bool
+	}{
+		{name: "pod_uid_label_set_by_the_controller", oldPod: unlabeled, newPod: labeled, want: false},
+		{name: "pod_uid_label_removed", oldPod: labeled, newPod: unlabeled, want: true},
+		{
+			name:   "pod_uid_label_changed",
+			oldPod: labeled,
+			newPod: withLabels(map[string]string{"app": "nginx", workloadsv1alpha1.PodUIDLabel: "other"}),
+			want:   true,
+		},
+		{
+			name:   "other_label_changed_with_pod_uid_label",
+			oldPod: labeled,
+			newPod: withLabels(map[string]string{"app": "redis", workloadsv1alpha1.PodUIDLabel: podUID}),
+			want:   true,
+		},
+	}
+	for _, tc := range podUIDCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := p.Update(event.UpdateEvent{ObjectOld: tc.oldPod, ObjectNew: tc.newPod}); got != tc.want {
+				t.Errorf("Update() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// testPDBPod returns a Pod for the Per-Pod PDB tests, with the UID "uid-<name>".
+func testPDBPod(name string, podLabels map[string]string) *corev1.Pod {
+	pod := testPod(name, podLabels, time.Now())
+	pod.UID = types.UID("uid-" + name)
+	return pod
+}
+
+// testOwnedPDB returns the Per-Pod PDB of the Pod, controlled by the WorkloadClass.
+func testOwnedPDB(wc *workloadsv1alpha1.WorkloadClass, pod *corev1.Pod, maxUnavailable intstr.IntOrString) *policyv1.PodDisruptionBudget {
+	pdb := utils.PDBBase(pod)
+	pdb.OwnerReferences = []metav1.OwnerReference{
+		*metav1.NewControllerRef(wc, workloadsv1alpha1.GroupVersion.WithKind("WorkloadClass")),
+	}
+	pdb.Spec = policyv1.PodDisruptionBudgetSpec{
+		MaxUnavailable: &maxUnavailable,
+		Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{workloadsv1alpha1.PodUIDLabel: string(pod.UID)}},
+	}
+	return pdb
+}
+
+func TestReconcilePDBs(t *testing.T) {
+	nginx := map[string]string{"app": "nginx"}
+	closed, open := intstr.FromInt32(0), intstr.FromString("100%")
+	validated := func(status metav1.ConditionStatus, reason string) metav1.Condition {
+		return metav1.Condition{Type: workloadsv1alpha1.ConditionTypeValidated, Status: status, Reason: reason}
+	}
+	passed := validated(metav1.ConditionTrue, workloadsv1alpha1.ReasonValidationPassed)
+	failed := validated(metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
+	newWC := func(name string, readiness workloadsv1alpha1.MaintenanceReadiness) *workloadsv1alpha1.WorkloadClass {
+		wc := testWorkloadClass(name, "ns", nginx)
+		wc.UID = types.UID("uid-" + name)
+		wc.Status.MaintenanceReadiness = readiness
+		return wc
+	}
+	notReadyWC := newWC("wc", workloadsv1alpha1.ReadinessNotReady)
+	readyWC := newWC("wc", workloadsv1alpha1.ReadinessReady)
+	deletingWC := readyWC.DeepCopy()
+	deletingWC.DeletionTimestamp = ptr.To(metav1.Now())
+	succeeded := testPDBPod("succeeded", nginx)
+	succeeded.Status.Phase = corev1.PodSucceeded
+	userPDB := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "workload-web-1", Namespace: "ns"},
+		Spec:       policyv1.PodDisruptionBudgetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "unrelated"}}},
+	}
+
+	// wantPDB is the expected controller and maxUnavailable of a PDB. An empty owner means a PDB that is not managed
+	// by a WorkloadClass and must be left untouched.
+	type wantPDB struct{ owner, maxUnavailable string }
+	testCases := []struct {
+		name      string
+		wc        *workloadsv1alpha1.WorkloadClass
+		validated metav1.Condition
+		objects   []client.Object
+		wantErr   string
+		wantPDBs  map[string]*wantPDB // PDB name -> expected PDB, or nil if it must not exist
+	}{
+		{
+			name:      "not_ready_class_creates_closed_pdbs_for_governed_pods",
+			wc:        notReadyWC,
+			validated: passed,
+			objects:   []client.Object{testPDBPod("web-1", nginx), testPDBPod("web-2", nginx), testPDBPod("other", map[string]string{"app": "redis"})},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc", maxUnavailable: "0"},
+				"workload-web-2": {owner: "wc", maxUnavailable: "0"},
+				"workload-other": nil,
+			},
+		},
+		{
+			name:      "ready_class_creates_open_pdbs",
+			wc:        readyWC,
+			validated: passed,
+			objects:   []client.Object{testPDBPod("web-1", nginx)},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": {owner: "wc", maxUnavailable: "100%"}},
+		},
+		{
+			name:      "inactive_pods_get_no_pdb",
+			wc:        notReadyWC,
+			validated: passed,
+			objects:   []client.Object{succeeded, terminatingTestPod("terminating", nginx, time.Now(), time.Now())},
+			wantPDBs:  map[string]*wantPDB{"workload-succeeded": nil, "workload-terminating": nil},
+		},
+		{
+			name:      "validation_failed_opens_owned_pdbs_and_creates_none",
+			wc:        notReadyWC,
+			validated: failed,
+			objects: []client.Object{
+				testPDBPod("web-1", nginx), testPDBPod("web-2", nginx),
+				testOwnedPDB(notReadyWC, testPDBPod("web-1", nginx), closed),
+				testOwnedPDB(notReadyWC, testPDBPod("gone", nginx), closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc", maxUnavailable: "100%"},
+				"workload-web-2": nil,
+				// Deleting the PDBs of Pods that are gone is left to a later change.
+				"workload-gone": {owner: "wc", maxUnavailable: "0"},
+			},
+		},
+		{
+			name:      "no_guardrails_creates_none",
+			wc:        readyWC,
+			validated: validated(metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails),
+			objects:   []client.Object{testPDBPod("web-1", nginx)},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil},
+		},
+		{
+			name:      "user_pdb_with_the_same_name_is_left_untouched",
+			wc:        readyWC,
+			validated: passed,
+			objects:   []client.Object{testPDBPod("web-1", nginx), testPDBPod("web-2", nginx), userPDB},
+			wantErr:   "PodDisruptionBudget ns/workload-web-1 already exists and is not managed by a WorkloadClass",
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {},
+				"workload-web-2": {owner: "wc", maxUnavailable: "100%"},
+			},
+		},
+		{
+			name:      "pdb_controlled_by_another_class_is_taken_over",
+			wc:        notReadyWC,
+			validated: passed,
+			objects: []client.Object{
+				testPDBPod("web-1", nginx),
+				testOwnedPDB(newWC("wc-old", workloadsv1alpha1.ReadinessReady), testPDBPod("web-1", nginx), open),
+			},
+			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: "wc", maxUnavailable: "0"}},
+		},
+		{
+			name:      "deleting_class_is_skipped",
+			wc:        deletingWC,
+			validated: passed,
+			objects:   []client.Object{testPDBPod("web-1", nginx)},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newTestScheme(t)
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.objects...).Build()
+			r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
+
+			err := r.reconcilePDBs(t.Context(), tc.wc, tc.validated)
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("reconcilePDBs() returned unexpected error: %v", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("reconcilePDBs() error = %v, want it to contain %q", err, tc.wantErr)
+			}
+
+			for name, want := range tc.wantPDBs {
+				pdb := &policyv1.PodDisruptionBudget{}
+				err := c.Get(t.Context(), client.ObjectKey{Name: name, Namespace: "ns"}, pdb)
+				if want == nil {
+					if !errors.IsNotFound(err) {
+						t.Errorf("PDB %s: want it to not exist, got err = %v", name, err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("PDB %s: want it to exist, got err = %v", name, err)
+				}
+				owner := metav1.GetControllerOf(pdb)
+				if want.owner == "" {
+					if owner != nil || pdb.Spec.MaxUnavailable != nil {
+						t.Errorf("PDB %s: want it untouched, got controller %v and maxUnavailable %v", name, owner, pdb.Spec.MaxUnavailable)
+					}
+					continue
+				}
+				if owner == nil || owner.Name != want.owner || len(pdb.OwnerReferences) != 1 {
+					t.Fatalf("PDB %s: ownerReferences = %v, want only the controller %s", name, pdb.OwnerReferences, want.owner)
+				}
+				if !ptr.Deref(owner.BlockOwnerDeletion, false) {
+					t.Errorf("PDB %s: controller blockOwnerDeletion = %v, want true", name, owner.BlockOwnerDeletion)
+				}
+				if got := pdb.Spec.MaxUnavailable.String(); got != want.maxUnavailable {
+					t.Errorf("PDB %s: maxUnavailable = %s, want %s", name, got, want.maxUnavailable)
+				}
+
+				podName := utils.PodNameFromPDBName(name)
+				pod := &corev1.Pod{}
+				if err := c.Get(t.Context(), client.ObjectKey{Name: podName, Namespace: "ns"}, pod); err != nil {
+					continue // The PDB of a Pod that is gone is left as it is.
+				}
+				wantLabels := map[string]string{workloadsv1alpha1.PodUIDLabel: string(pod.UID)}
+				if !maps.Equal(pdb.Spec.Selector.MatchLabels, wantLabels) || len(pdb.Spec.Selector.MatchExpressions) > 0 ||
+					!maps.Equal(pdb.Labels, wantLabels) {
+					t.Errorf("PDB %s: selector = %v, labels = %v, want both %v", name, pdb.Spec.Selector, pdb.Labels, wantLabels)
+				}
+				if p := pdb.Spec.UnhealthyPodEvictionPolicy; p == nil || *p != policyv1.AlwaysAllow {
+					t.Errorf("PDB %s: unhealthyPodEvictionPolicy = %v, want %s", name, p, policyv1.AlwaysAllow)
+				}
+				if protectsPods(tc.validated) && pod.Labels[workloadsv1alpha1.PodUIDLabel] != string(pod.UID) {
+					t.Errorf("Pod %s: labels = %v, want %s=%s", podName, pod.Labels, workloadsv1alpha1.PodUIDLabel, pod.UID)
+				}
+			}
+		})
 	}
 }
 

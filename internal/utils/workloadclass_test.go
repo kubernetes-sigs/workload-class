@@ -276,6 +276,37 @@ func TestBestMatchWorkloadClassForPod(t *testing.T) {
 	}
 }
 
+func TestIsPodActive(t *testing.T) {
+	deleting := metav1.Now()
+	testCases := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{name: "nil_pod", pod: nil, want: false},
+		{name: "pending", pod: &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}, want: true},
+		{name: "running", pod: &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodRunning}}, want: true},
+		{name: "unset_phase", pod: &corev1.Pod{}, want: true},
+		{name: "succeeded", pod: &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodSucceeded}}, want: false},
+		{name: "failed", pod: &corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodFailed}}, want: false},
+		{
+			name: "terminating",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deleting},
+				Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsPodActive(tc.pod); got != tc.want {
+				t.Errorf("IsPodActive() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNamespaceEnforcedWorkloadClass(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {

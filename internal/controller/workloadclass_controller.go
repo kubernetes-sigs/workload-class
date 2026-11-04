@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -27,7 +28,9 @@ import (
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -38,6 +41,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -81,8 +85,9 @@ type WorkloadClassReconciler struct {
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclassguardrails,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=list;watch;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -90,7 +95,8 @@ type WorkloadClassReconciler struct {
 // It validates the WorkloadClass against all WorkloadClassGuardrails and against the
 // other WorkloadClasses in its namespace, and surfaces the result as the Validated condition.
 // It then calculates the MaintenanceReadiness of the WorkloadClass, surfaces it with the
-// MaintenanceAllowed condition, and requeues the WorkloadClass at the next readiness transition.
+// MaintenanceAllowed condition, reconciles the Per-Pod PodDisruptionBudgets of the Pods it
+// governs (see reconcilePDBs), and requeues the WorkloadClass at the next readiness transition.
 func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -138,8 +144,13 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	if readinessErr != nil {
-		return ctrl.Result{}, readinessErr
+	pdbErr := r.reconcilePDBs(ctx, wc, cond)
+	if pdbErr != nil {
+		log.Error(pdbErr, "Failed to reconcile PodDisruptionBudgets")
+	}
+
+	if err := errors.Join(readinessErr, pdbErr); err != nil {
+		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: readiness.requeueAfter}, nil
 }
@@ -528,6 +539,138 @@ func (r *WorkloadClassReconciler) governedPods(ctx context.Context, wc *workload
 	}), nil
 }
 
+// protectsPods reports whether a WorkloadClass with the given Validated condition protects the Pods it governs with
+// Per-Pod PodDisruptionBudgets that follow its MaintenanceReadiness.
+//
+// Only a WorkloadClass that passed validation against at least one guardrail does (ReasonValidationPassed, since
+// ReasonNoGuardrails is reported when no guardrail exists), so that PDBs block disruptions only where a guardrail
+// bounds the disruption policy, e.g. through maxNonDisruptionDurationDays.
+func protectsPods(validated metav1.Condition) bool {
+	return validated.Status == metav1.ConditionTrue && validated.Reason == workloadsv1alpha1.ReasonValidationPassed
+}
+
+// reconcilePDBs reconciles the Per-Pod PodDisruptionBudgets (see utils.PDBName) of the Pods governed by the
+// WorkloadClass (see governedPods):
+//
+//   - If the WorkloadClass protects Pods (see protectsPods), each active governed Pod is labeled with its UID
+//     (PodUIDLabel) and gets a PDB that selects only that Pod, is controlled by the WorkloadClass, and follows its
+//     MaintenanceReadiness (see utils.SyncPDBWithWorkloadClass). Terminating and terminal Pods get no PDB.
+//   - Otherwise, the PDBs that the WorkloadClass controls are opened (MaxUnavailable = 100%) for the Pods that still
+//     exist and are active, rather than deleted, and no PDB is created.
+//
+// A WorkloadClass that is being deleted is skipped, since its PDBs are garbage collected through their owner
+// references. An error for one Pod does not stop the others; all errors are returned.
+func (r *WorkloadClassReconciler) reconcilePDBs(
+	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, validated metav1.Condition,
+) error {
+	if !wc.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	if !protectsPods(validated) {
+		return r.openOwnedPDBs(ctx, wc)
+	}
+
+	pods, err := r.governedPods(ctx, wc)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for i := range pods {
+		pod := &pods[i]
+		if !utils.IsPodActive(pod) {
+			continue
+		}
+		if err := r.ensurePodUIDLabel(ctx, pod); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		errs = append(errs, r.syncPodPDB(ctx, wc, pod, true))
+	}
+	return errors.Join(errs...)
+}
+
+// openOwnedPDBs opens the PodDisruptionBudgets controlled by the WorkloadClass whose Pod still exists and is active.
+// PDBs whose Pod is gone or inactive are left as they are.
+func (r *WorkloadClassReconciler) openOwnedPDBs(ctx context.Context, wc *workloadsv1alpha1.WorkloadClass) error {
+	pdbs := &policyv1.PodDisruptionBudgetList{}
+	if err := r.List(ctx, pdbs, client.InNamespace(wc.Namespace)); err != nil {
+		return fmt.Errorf("failed to list PodDisruptionBudgets: %w", err)
+	}
+	var errs []error
+	for i := range pdbs.Items {
+		pdb := &pdbs.Items[i]
+		if !metav1.IsControlledBy(pdb, wc) {
+			continue
+		}
+		pod := &corev1.Pod{}
+		key := client.ObjectKey{Name: utils.PodNameFromPDBName(pdb.Name), Namespace: pdb.Namespace}
+		if err := r.Get(ctx, key, pod); err != nil {
+			if !apierrors.IsNotFound(err) {
+				errs = append(errs, fmt.Errorf("failed to get Pod %s: %w", key.Name, err))
+			}
+			continue
+		}
+		if utils.PDBName(pod.Name) != pdb.Name || !utils.IsPodActive(pod) {
+			continue
+		}
+		errs = append(errs, r.syncPodPDB(ctx, wc, pod, false))
+	}
+	return errors.Join(errs...)
+}
+
+// ensurePodUIDLabel labels the Pod with its UID (PodUIDLabel) so that its Per-Pod PodDisruptionBudget can select it.
+// The label is added with a merge patch rather than an update, since the cached Pod may be stripped (see
+// StripPodForReadiness).
+func (r *WorkloadClassReconciler) ensurePodUIDLabel(ctx context.Context, pod *corev1.Pod) error {
+	if pod.Labels[workloadsv1alpha1.PodUIDLabel] == string(pod.UID) {
+		return nil
+	}
+	patch := client.MergeFrom(pod.DeepCopy())
+	metav1.SetMetaDataLabel(&pod.ObjectMeta, workloadsv1alpha1.PodUIDLabel, string(pod.UID))
+	if err := r.Patch(ctx, pod, patch); err != nil {
+		return fmt.Errorf("failed to label Pod %s: %w", pod.Name, err)
+	}
+	return nil
+}
+
+// syncPodPDB creates or updates the Per-Pod PodDisruptionBudget of the Pod to match the WorkloadClass (see
+// utils.SyncPDBWithWorkloadClass), after claiming it for the WorkloadClass (see claimPDB).
+func (r *WorkloadClassReconciler) syncPodPDB(
+	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, pod *corev1.Pod, protects bool,
+) error {
+	pdb := utils.PDBBase(pod)
+	op, err := controllerutil.CreateOrUpdate(ctx, r.Client, pdb, func() error {
+		if err := r.claimPDB(wc, pdb); err != nil {
+			return err
+		}
+		return utils.SyncPDBWithWorkloadClass(wc, pod, pdb, protects)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to reconcile PodDisruptionBudget %s: %w", pdb.Name, err)
+	}
+	if op != controllerutil.OperationResultNone {
+		logf.FromContext(ctx).Info("Reconciled PodDisruptionBudget",
+			"podDisruptionBudget", pdb.Name, "pod", pod.Name, "operation", op, "maxUnavailable", pdb.Spec.MaxUnavailable)
+	}
+	return nil
+}
+
+// claimPDB sets the WorkloadClass as the controller of the PodDisruptionBudget, taking it over from another
+// WorkloadClass if needed (e.g. when the best-match WorkloadClass of the Pod changes). It refuses to modify an
+// existing PDB that is not managed by a WorkloadClass (see utils.IsWorkloadClassManagedPDB).
+func (r *WorkloadClassReconciler) claimPDB(wc *workloadsv1alpha1.WorkloadClass, pdb *policyv1.PodDisruptionBudget) error {
+	if pdb.ResourceVersion != "" && !utils.IsWorkloadClassManagedPDB(pdb) {
+		return fmt.Errorf("PodDisruptionBudget %s/%s already exists and is not managed by a WorkloadClass",
+			pdb.Namespace, pdb.Name)
+	}
+	if owner := metav1.GetControllerOf(pdb); owner != nil && owner.UID != wc.UID {
+		pdb.OwnerReferences = slices.DeleteFunc(pdb.OwnerReferences, func(ref metav1.OwnerReference) bool {
+			return ptr.Deref(ref.Controller, false)
+		})
+	}
+	return controllerutil.SetControllerReference(wc, pdb, r.Scheme)
+}
+
 // recordPodTerminations advances Status.LastPodTerminationTime of the WorkloadClass to the most recent time one of
 // the Pods started terminating. Pods in a terminal phase are ignored.
 func recordPodTerminations(wc *workloadsv1alpha1.WorkloadClass, pods []corev1.Pod) {
@@ -719,6 +862,8 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.workloadClassesInNamespace),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
+		// Restore a managed PodDisruptionBudget when it is deleted or its spec is changed by someone else.
+		Owns(&policyv1.PodDisruptionBudget{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// Re-calculate the maintenance readiness of the WorkloadClasses that select a Pod when the Pod is created or
 		// deleted, starts running or terminating, reaches a terminal phase, or changes labels.
 		Watches(
@@ -767,8 +912,9 @@ func lastDisruptionTimeChangedPredicate() predicate.Funcs {
 }
 
 // podReadinessPredicate passes Pod creation and deletion events, and Pod updates that can change the maintenance
-// readiness of the WorkloadClasses that select the Pod: label changes, the Pod starting to run (Status.StartTime
-// set), the Pod starting to terminate, and the Pod reaching a terminal phase.
+// readiness or the Per-Pod PodDisruptionBudget of the WorkloadClasses that select the Pod: label changes (see
+// podLabelsChanged), the Pod starting to run (Status.StartTime set), the Pod starting to terminate, and the Pod
+// reaching a terminal phase.
 func podReadinessPredicate() predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc:  func(event.CreateEvent) bool { return true },
@@ -780,12 +926,33 @@ func podReadinessPredicate() predicate.Funcs {
 			if !okOld || !okNew {
 				return false
 			}
-			return !maps.Equal(oldPod.Labels, newPod.Labels) ||
+			return podLabelsChanged(oldPod, newPod) ||
 				!podStartTime(oldPod).Equal(podStartTime(newPod)) ||
 				oldPod.DeletionTimestamp.IsZero() != newPod.DeletionTimestamp.IsZero() ||
 				isPodTerminal(oldPod) != isPodTerminal(newPod)
 		},
 	}
+}
+
+// podLabelsChanged reports whether the labels of the Pod changed, ignoring the controller's own update that sets the
+// workloads.x-k8s.io/pod-uid (PodUIDLabel) label to the Pod's UID. Removing or changing that label still counts, so
+// that the controller restores it.
+func podLabelsChanged(oldPod, newPod *corev1.Pod) bool {
+	if maps.Equal(oldPod.Labels, newPod.Labels) {
+		return false
+	}
+	return newPod.Labels[workloadsv1alpha1.PodUIDLabel] != string(newPod.UID) ||
+		!maps.Equal(labelsWithoutPodUID(oldPod.Labels), labelsWithoutPodUID(newPod.Labels))
+}
+
+// labelsWithoutPodUID returns the Pod labels without the workloads.x-k8s.io/pod-uid (PodUIDLabel) label.
+func labelsWithoutPodUID(podLabels map[string]string) map[string]string {
+	if _, ok := podLabels[workloadsv1alpha1.PodUIDLabel]; !ok {
+		return podLabels
+	}
+	filtered := maps.Clone(podLabels)
+	delete(filtered, workloadsv1alpha1.PodUIDLabel)
+	return filtered
 }
 
 // enforcedClassLabelChangedPredicate passes Namespace creations with a non-empty workloads.x-k8s.io/enforced-class

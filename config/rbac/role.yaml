@@ -18,6 +18,19 @@ rules:
   - pods
   verbs:
   - list
+  - patch
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - workloads.x-k8s.io
