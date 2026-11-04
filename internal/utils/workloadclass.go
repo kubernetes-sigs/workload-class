@@ -67,6 +67,13 @@ func NamespaceEnforcedWorkloadClass(
 	return wc, true, nil
 }
 
+// IsPodActive reports whether the Pod is active: it is not terminating and has not reached a terminal phase
+// (Succeeded or Failed). Only active Pods get a Per-Pod PodDisruptionBudget.
+func IsPodActive(pod *corev1.Pod) bool {
+	return pod != nil && pod.DeletionTimestamp.IsZero() &&
+		pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed
+}
+
 // BestMatchWorkloadClassForPod returns the WorkloadClass that applies to the Pod, evaluated in memory from the result
 // of NamespaceEnforcedWorkloadClass for the Pod's Namespace and the WorkloadClasses in it, or nil if none applies.
 //
