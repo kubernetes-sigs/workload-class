@@ -523,20 +523,30 @@ func (r *WorkloadClassReconciler) governedPods(ctx context.Context, wc *workload
 		return pods.Items, nil
 	}
 
-	workloadClasses := &workloadsv1alpha1.WorkloadClassList{}
-	if err := r.List(ctx, workloadClasses, client.InNamespace(wc.Namespace)); err != nil {
-		return nil, fmt.Errorf("failed to list WorkloadClasses: %w", err)
+	candidates, err := r.bestMatchCandidates(ctx, wc)
+	if err != nil {
+		return nil, err
 	}
-	// Rank the WorkloadClass as it is being reconciled, in case the list holds an older copy or does not include it.
-	candidates := slices.DeleteFunc(workloadClasses.Items, func(other workloadsv1alpha1.WorkloadClass) bool {
-		return other.Name == wc.Name
-	})
-	candidates = append(candidates, *wc)
-
 	return slices.DeleteFunc(pods.Items, func(pod corev1.Pod) bool {
 		bestMatch, _, _ := utils.SelectorBestMatch(&pod, candidates)
 		return bestMatch == nil || bestMatch.Name != wc.Name
 	}), nil
+}
+
+// bestMatchCandidates returns the WorkloadClasses in the namespace of the WorkloadClass, with the listed copy of the
+// WorkloadClass replaced by wc, so that it is ranked as it is being reconciled even if the list holds an older copy or
+// does not include it.
+func (r *WorkloadClassReconciler) bestMatchCandidates(
+	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass,
+) ([]workloadsv1alpha1.WorkloadClass, error) {
+	workloadClasses := &workloadsv1alpha1.WorkloadClassList{}
+	if err := r.List(ctx, workloadClasses, client.InNamespace(wc.Namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list WorkloadClasses: %w", err)
+	}
+	candidates := slices.DeleteFunc(workloadClasses.Items, func(other workloadsv1alpha1.WorkloadClass) bool {
+		return other.Name == wc.Name
+	})
+	return append(candidates, *wc), nil
 }
 
 // protectsPods reports whether a WorkloadClass with the given Validated condition protects the Pods it governs with
@@ -549,14 +559,22 @@ func protectsPods(validated metav1.Condition) bool {
 	return validated.Status == metav1.ConditionTrue && validated.Reason == workloadsv1alpha1.ReasonValidationPassed
 }
 
+// statusProtectsPods reports whether the Validated condition in the status of the WorkloadClass shows that it protects
+// the Pods it governs (see protectsPods).
+func statusProtectsPods(wc *workloadsv1alpha1.WorkloadClass) bool {
+	validated := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated)
+	return validated != nil && protectsPods(*validated)
+}
+
 // reconcilePDBs reconciles the Per-Pod PodDisruptionBudgets (see utils.PDBName) of the Pods governed by the
 // WorkloadClass (see governedPods):
 //
 //   - If the WorkloadClass protects Pods (see protectsPods), each active governed Pod is labeled with its UID
 //     (PodUIDLabel) and gets a PDB that selects only that Pod, is controlled by the WorkloadClass, and follows its
-//     MaintenanceReadiness (see utils.SyncPDBWithWorkloadClass). Terminating and terminal Pods get no PDB.
-//   - Otherwise, the PDBs that the WorkloadClass controls are opened (MaxUnavailable = 100%) for the Pods that still
-//     exist and are active, rather than deleted, and no PDB is created.
+//     MaintenanceReadiness (see utils.SyncPDBWithWorkloadClass). Terminating and terminal Pods get no PDB. The other
+//     PDBs that the WorkloadClass controls are handed over or deleted (see reconcileOwnedPDBs).
+//   - Otherwise, the PDBs that the WorkloadClass controls are opened (MaxUnavailable = 100%) for the Pods that are
+//     still active, rather than deleted, and no PDB is created (see reconcileOwnedPDBs).
 //
 // A WorkloadClass that is being deleted is skipped, since its PDBs are garbage collected through their owner
 // references. An error for one Pod does not stop the others; all errors are returned.
@@ -566,8 +584,15 @@ func (r *WorkloadClassReconciler) reconcilePDBs(
 	if !wc.DeletionTimestamp.IsZero() {
 		return nil
 	}
+	pdbs := &policyv1.PodDisruptionBudgetList{}
+	if err := r.List(ctx, pdbs, client.InNamespace(wc.Namespace)); err != nil {
+		return fmt.Errorf("failed to list PodDisruptionBudgets: %w", err)
+	}
+	owned := slices.DeleteFunc(pdbs.Items, func(pdb policyv1.PodDisruptionBudget) bool {
+		return !metav1.IsControlledBy(&pdb, wc)
+	})
 	if !protectsPods(validated) {
-		return r.openOwnedPDBs(ctx, wc)
+		return r.reconcileOwnedPDBs(ctx, wc, owned, nil, true)
 	}
 
 	pods, err := r.governedPods(ctx, wc)
@@ -575,47 +600,122 @@ func (r *WorkloadClassReconciler) reconcilePDBs(
 		return err
 	}
 	var errs []error
+	protected := sets.New[string]()
 	for i := range pods {
 		pod := &pods[i]
 		if !utils.IsPodActive(pod) {
 			continue
 		}
+		protected.Insert(utils.PDBName(pod.Name))
 		if err := r.ensurePodUIDLabel(ctx, pod); err != nil {
 			errs = append(errs, err)
 			continue
 		}
 		errs = append(errs, r.syncPodPDB(ctx, wc, pod, true))
 	}
+	errs = append(errs, r.reconcileOwnedPDBs(ctx, wc, owned, protected, false))
 	return errors.Join(errs...)
 }
 
-// openOwnedPDBs opens the PodDisruptionBudgets controlled by the WorkloadClass whose Pod still exists and is active.
-// PDBs whose Pod is gone or inactive are left as they are.
-func (r *WorkloadClassReconciler) openOwnedPDBs(ctx context.Context, wc *workloadsv1alpha1.WorkloadClass) error {
-	pdbs := &policyv1.PodDisruptionBudgetList{}
-	if err := r.List(ctx, pdbs, client.InNamespace(wc.Namespace)); err != nil {
-		return fmt.Errorf("failed to list PodDisruptionBudgets: %w", err)
+// reconcileOwnedPDBs reconciles the PodDisruptionBudgets controlled by the WorkloadClass, except those named in
+// protected (the PDBs of the active Pods it protects):
+//
+//   - A PDB whose Pod is gone, terminating, or in a terminal phase is deleted.
+//   - A PDB whose Pod is now governed by another WorkloadClass that protects Pods is left as it is, for that
+//     WorkloadClass to take over (see claimPDB).
+//   - Otherwise, the PDB is opened (MaxUnavailable = 100%) if open is true, or deleted, since no WorkloadClass that
+//     protects Pods governs its Pod anymore (e.g. the Pod was relabeled).
+func (r *WorkloadClassReconciler) reconcileOwnedPDBs(
+	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, owned []policyv1.PodDisruptionBudget,
+	protected sets.Set[string], open bool,
+) error {
+	if len(owned) == 0 {
+		return nil
 	}
+	enforcedWC, enforced, err := utils.NamespaceEnforcedWorkloadClass(ctx, r.Client, wc.Namespace)
+	if err != nil {
+		return err
+	}
+	candidates, err := r.bestMatchCandidates(ctx, wc)
+	if err != nil {
+		return err
+	}
+
 	var errs []error
-	for i := range pdbs.Items {
-		pdb := &pdbs.Items[i]
-		if !metav1.IsControlledBy(pdb, wc) {
+	for i := range owned {
+		pdb := &owned[i]
+		if protected.Has(pdb.Name) {
 			continue
 		}
-		pod := &corev1.Pod{}
-		key := client.ObjectKey{Name: utils.PodNameFromPDBName(pdb.Name), Namespace: pdb.Namespace}
-		if err := r.Get(ctx, key, pod); err != nil {
-			if !apierrors.IsNotFound(err) {
-				errs = append(errs, fmt.Errorf("failed to get Pod %s: %w", key.Name, err))
+		pod, err := r.getPodForPDB(ctx, pdb)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if utils.IsPodActive(pod) {
+			bestMatch := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, enforced, candidates)
+			if bestMatch != nil && bestMatch.Name != wc.Name && statusProtectsPods(bestMatch) {
+				continue
 			}
-			continue
+			if open {
+				errs = append(errs, r.syncPodPDB(ctx, wc, pod, false))
+				continue
+			}
 		}
-		if utils.PDBName(pod.Name) != pdb.Name || !utils.IsPodActive(pod) {
-			continue
-		}
-		errs = append(errs, r.syncPodPDB(ctx, wc, pod, false))
+		errs = append(errs, r.deletePDB(ctx, wc, pdb))
 	}
 	return errors.Join(errs...)
+}
+
+// deletePDB deletes the PodDisruptionBudget if the WorkloadClass still controls it. The PDB is read again and deleted
+// with UID and resourceVersion preconditions, so that a PDB that another WorkloadClass has taken over in the meantime
+// is never deleted.
+func (r *WorkloadClassReconciler) deletePDB(
+	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, pdb *policyv1.PodDisruptionBudget,
+) error {
+	current := &policyv1.PodDisruptionBudget{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(pdb), current); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(current, wc) {
+		return nil
+	}
+	preconditions := client.Preconditions{UID: &current.UID, ResourceVersion: &current.ResourceVersion}
+	if err := r.Delete(ctx, current, preconditions); client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("failed to delete PodDisruptionBudget %s: %w", pdb.Name, err)
+	}
+	logf.FromContext(ctx).Info("Deleted PodDisruptionBudget", "podDisruptionBudget", pdb.Name)
+	return nil
+}
+
+// getPodForPDB returns the Pod of a Per-Pod PodDisruptionBudget, or nil if it does not exist.
+//
+// The Pod is looked up by the name the PDB name was derived from (see utils.PodNameFromPDBName). If no such Pod
+// exists, or it is not the Pod instance the PDB was created for (its UID differs from the PDB's PodUIDLabel label,
+// e.g. the name was truncated by utils.PDBName, or the Pod was recreated with the same name), the Pod is looked up by
+// the PodUIDLabel label instead. If that finds no Pod either, the Pod with the derived name is returned, if any.
+func (r *WorkloadClassReconciler) getPodForPDB(ctx context.Context, pdb *policyv1.PodDisruptionBudget) (*corev1.Pod, error) {
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, client.ObjectKey{Name: utils.PodNameFromPDBName(pdb.Name), Namespace: pdb.Namespace}, pod); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get Pod for PodDisruptionBudget %s: %w", pdb.Name, err)
+		}
+		pod = nil
+	}
+	uid := pdb.Labels[workloadsv1alpha1.PodUIDLabel]
+	if uid == "" || (pod != nil && string(pod.UID) == uid) {
+		return pod, nil
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(pdb.Namespace), client.MatchingLabels{workloadsv1alpha1.PodUIDLabel: uid}); err != nil {
+		return nil, fmt.Errorf("failed to list Pods: %w", err)
+	}
+	for i := range pods.Items {
+		if string(pods.Items[i].UID) == uid {
+			return &pods.Items[i], nil
+		}
+	}
+	return pod, nil
 }
 
 // ensurePodUIDLabel labels the Pod with its UID (PodUIDLabel) so that its Per-Pod PodDisruptionBudget can select it.
@@ -856,19 +956,21 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		// Re-validate the other WorkloadClasses in a namespace when a WorkloadClass is created, deleted, or its spec
-		// changes, so that their SelectorOverlap status stays current.
+		// changes, so that their SelectorOverlap status stays current, and when it starts or stops protecting Pods, so
+		// that they hand over or delete the PDBs of the Pods it governs.
 		Watches(
 			&workloadsv1alpha1.WorkloadClass{},
 			handler.EnqueueRequestsFromMapFunc(r.workloadClassesInNamespace),
-			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			builder.WithPredicates(predicate.Or(predicate.GenerationChangedPredicate{}, protectionChangedPredicate())),
 		).
 		// Restore a managed PodDisruptionBudget when it is deleted or its spec is changed by someone else.
 		Owns(&policyv1.PodDisruptionBudget{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		// Re-calculate the maintenance readiness of the WorkloadClasses that select a Pod when the Pod is created or
-		// deleted, starts running or terminating, reaches a terminal phase, or changes labels.
+		// deleted, starts running or terminating, reaches a terminal phase, or changes labels, and let the WorkloadClass
+		// that controls its PDB delete or hand it over.
 		Watches(
 			&corev1.Pod{},
-			handler.EnqueueRequestsFromMapFunc(r.workloadClassesSelectingPod),
+			handler.EnqueueRequestsFromMapFunc(r.workloadClassesForPod),
 			builder.WithPredicates(podReadinessPredicate()),
 		).
 		// Re-validate and re-calculate the maintenance readiness of every WorkloadClass in a Namespace when its enforced
@@ -907,6 +1009,18 @@ func lastDisruptionTimeChangedPredicate() predicate.Funcs {
 				return false
 			}
 			return !ptr.Equal(oldWC.Status.LastDisruptionTime, newWC.Status.LastDisruptionTime)
+		},
+	}
+}
+
+// protectionChangedPredicate passes WorkloadClass updates after which its status shows that it started or stopped
+// protecting the Pods it governs (see statusProtectsPods). Creation, deletion, and generic events pass through.
+func protectionChangedPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldWC, okOld := e.ObjectOld.(*workloadsv1alpha1.WorkloadClass)
+			newWC, okNew := e.ObjectNew.(*workloadsv1alpha1.WorkloadClass)
+			return okOld && okNew && statusProtectsPods(oldWC) != statusProtectsPods(newWC)
 		},
 	}
 }
@@ -970,6 +1084,28 @@ func enforcedClassLabelChangedPredicate() predicate.Funcs {
 		DeleteFunc:  func(event.DeleteEvent) bool { return false },
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}
+}
+
+// workloadClassesForPod maps a Pod to reconcile requests for the WorkloadClasses that can govern it (see
+// workloadClassesSelectingPod), and for the WorkloadClass that controls its Per-Pod PodDisruptionBudget, so that the
+// PDB is deleted or handed over when that WorkloadClass no longer governs the Pod (e.g. the Pod was deleted).
+func (r *WorkloadClassReconciler) workloadClassesForPod(ctx context.Context, obj client.Object) []reconcile.Request {
+	requests := r.workloadClassesSelectingPod(ctx, obj)
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := r.Get(ctx, client.ObjectKey{Name: utils.PDBName(obj.GetName()), Namespace: obj.GetNamespace()}, pdb); err != nil {
+		if !apierrors.IsNotFound(err) {
+			logf.FromContext(ctx).Error(err, "Failed to get the PodDisruptionBudget of the Pod",
+				"namespace", obj.GetNamespace(), "pod", obj.GetName())
+		}
+		return requests
+	}
+	owner := metav1.GetControllerOf(pdb)
+	if !utils.IsWorkloadClassManagedPDB(pdb) || slices.ContainsFunc(requests, func(req reconcile.Request) bool {
+		return req.Name == owner.Name
+	}) {
+		return requests
+	}
+	return append(requests, reconcile.Request{NamespacedName: client.ObjectKey{Name: owner.Name, Namespace: pdb.Namespace}})
 }
 
 // workloadClassesSelectingPod maps a Pod to reconcile requests for the WorkloadClasses that can govern it: the
