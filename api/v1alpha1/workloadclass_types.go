@@ -143,6 +143,11 @@ const (
 	// WorkloadClass applies to all pods in the namespace and overrides PodSelector matching.
 	EnforcedWorkloadClassLabel = "workloads.x-k8s.io/enforced-class"
 
+	// PodUIDLabel is the label key the WorkloadClass controller sets on each Pod it governs, with the Pod's UID as
+	// the value. The Pod's PodDisruptionBudget selects only this label, so it covers exactly that Pod and never a
+	// later Pod that reuses the same name.
+	PodUIDLabel = "workloads.x-k8s.io/pod-uid"
+
 	// ConditionTypeValidated indicates if the WorkloadClass has been validated against Guardrails.
 	ConditionTypeValidated = "Validated"
 
