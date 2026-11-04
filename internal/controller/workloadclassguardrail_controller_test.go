@@ -132,7 +132,7 @@ var _ = Describe("WorkloadClassGuardrail Controller", func() {
 					if cond.Type == workloadsv1alpha1.ConditionTypeValidated {
 						return cond.Status == metav1.ConditionFalse &&
 							cond.Reason == workloadsv1alpha1.ReasonValidationFailed &&
-							strings.Contains(cond.Message, "daysOfWeek contains invalid days, valid days are")
+							strings.Contains(cond.Message, "`daysOfWeek` must only contain")
 					}
 				}
 				return false
