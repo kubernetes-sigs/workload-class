@@ -307,6 +307,31 @@ func TestIsPodActive(t *testing.T) {
 	}
 }
 
+func TestIsValidated(t *testing.T) {
+	validated := func(status metav1.ConditionStatus, reason string) *metav1.Condition {
+		return &metav1.Condition{Type: workloadsv1alpha1.ConditionTypeValidated, Status: status, Reason: reason}
+	}
+	testCases := []struct {
+		name string
+		cond *metav1.Condition
+		want bool
+	}{
+		{name: "nil_condition", cond: nil, want: false},
+		{name: "validation_passed", cond: validated(metav1.ConditionTrue, workloadsv1alpha1.ReasonValidationPassed), want: true},
+		{name: "no_guardrails", cond: validated(metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails), want: true},
+		{name: "selector_overlap", cond: validated(metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap), want: true},
+		{name: "validation_failed", cond: validated(metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed), want: false},
+		{name: "unknown_status", cond: validated(metav1.ConditionUnknown, ""), want: false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsValidated(tc.cond); got != tc.want {
+				t.Errorf("IsValidated() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNamespaceEnforcedWorkloadClass(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {

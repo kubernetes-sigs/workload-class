@@ -527,13 +527,30 @@ var _ = Describe("WorkloadClass Controller", func() {
 					workloadsv1alpha1.ReasonWithinDisruptionWindow)
 			})
 
-			It("should be Unknown with reason SelectorOverlap when the PodSelector overlaps with another WorkloadClass", func() {
-				Expect(k8sClient.Create(ctx, newWorkloadClass("test-workloadclass-overlapping"))).To(Succeed())
+			It("should evaluate a WorkloadClass with reason SelectorOverlap over the Pods it is the best match for", func() {
+				other := newWorkloadClass("test-workloadclass-overlapping")
+				other.Spec.PodSelector.MatchLabels["tier"] = "web"
+				Expect(k8sClient.Create(ctx, other)).To(Succeed())
+				updateWorkloadClass(func(wc *workloadsv1alpha1.WorkloadClass) {
+					wc.Spec.DisruptionPolicy.MinInitialRunDurationDays = 1
+				})
 
-				result, wc := reconcileAt(time.Now())
-				expectReadiness(wc, workloadsv1alpha1.ReadinessUnknown, metav1.ConditionUnknown,
-					workloadsv1alpha1.ReasonSelectorOverlap)
-				Expect(result.RequeueAfter).To(BeZero())
+				By("not being blocked by a young Pod that the more specific WorkloadClass governs")
+				Expect(k8sClient.Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: "young-web", Namespace: namespace, Labels: other.Spec.PodSelector.MatchLabels},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+				})).To(Succeed())
+				_, wc := reconcileAt(time.Now())
+				Expect(meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated).Reason).
+					To(Equal(workloadsv1alpha1.ReasonSelectorOverlap))
+				expectReadiness(wc, workloadsv1alpha1.ReadinessReady, metav1.ConditionTrue,
+					workloadsv1alpha1.ReasonWithinDisruptionWindow)
+
+				By("being NotReady while a young Pod that it governs has not run for MinInitialRunDurationDays")
+				createPod("young-test")
+				_, wc = reconcileAt(time.Now())
+				expectReadiness(wc, workloadsv1alpha1.ReadinessNotReady, metav1.ConditionFalse,
+					workloadsv1alpha1.ReasonMinInitialRunDurationNotMet)
 			})
 		})
 	})
@@ -810,11 +827,11 @@ var _ = Describe("WorkloadClass Controller", func() {
 					g.Expect(cond.Message).To(ContainSubstring(msg))
 				}).Should(Succeed())
 			}
-			const bothPods = "2 selected Pods"
+			const bothPods, oneWebPod = "2 selected Pods", "1 selected Pod (e.g. 'young-web')"
 
-			By("reporting SelectorOverlap on both WorkloadClasses without an enforced class")
-			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
-			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
+			By("reporting SelectorOverlap on both WorkloadClasses without an enforced class, splitting the Pods by best match")
+			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessReady, "")
+			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessNotReady, oneWebPod)
 
 			By("counting every Pod for the enforced class only, and not reporting overlap, once the label is set")
 			setNamespaceEnforcedClass(ns, "wc-broad")
@@ -833,8 +850,8 @@ var _ = Describe("WorkloadClass Controller", func() {
 
 			By("reporting SelectorOverlap again once the label is removed")
 			setNamespaceEnforcedClass(ns, "")
-			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
-			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessUnknown, "")
+			eventuallyStatus("wc-broad", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessReady, "")
+			eventuallyStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap, workloadsv1alpha1.ReadinessNotReady, oneWebPod)
 		})
 
 		It("should create, update, and restore the Per-Pod PDBs of a valid WorkloadClass, and open them when it fails validation", func() {
@@ -1131,7 +1148,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 			// Wait for wc-enforced to protect Pods, so that wc-web hands its PDBs over rather than deleting them.
 			Eventually(func(g Gomega) {
 				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(enforced), enforced)).To(Succeed())
-				g.Expect(statusProtectsPods(enforced)).To(BeTrue())
+				g.Expect(statusProtectsPods(enforced, true)).To(BeTrue())
 			}).Should(Succeed())
 
 			By("handing the PDBs over to the enforced class, which also creates one for the Pod no PodSelector selects")
@@ -1161,6 +1178,92 @@ var _ = Describe("WorkloadClass Controller", func() {
 			By("deleting every PDB when the label names a missing WorkloadClass")
 			setNamespaceEnforcedClass(ns, "wc-missing")
 			eventuallyPDBs("0", map[string]string{})
+		})
+
+		It("should keep protecting the Pods that each of two overlapping WorkloadClasses is the best match for", func() {
+			const ns = "wc-overlap-pdbs"
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.DeleteAllOf(ctx, &workloadsv1alpha1.WorkloadClass{}, client.InNamespace(ns))).To(Succeed())
+				deleteAllPods(ns)
+				Expect(k8sClient.DeleteAllOf(ctx, &policyv1.PodDisruptionBudget{}, client.InNamespace(ns))).To(Succeed())
+			})
+			Expect(k8sClient.Create(ctx, &workloadsv1alpha1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: guardrailName},
+				Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{Constraints: workloadsv1alpha1.Constraints{
+					Disruption: workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 10},
+				}},
+			})).To(Succeed())
+			// The window is never open during the test, so both WorkloadClasses are NotReady and their PDBs closed.
+			now := time.Now().UTC()
+			web := map[string]string{"app": "shop", "tier": "web"}
+			for name, matchLabels := range map[string]map[string]string{"wc-broad": {"app": "shop"}, "wc-web": web} {
+				Expect(k8sClient.Create(ctx, &workloadsv1alpha1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+					Spec: workloadsv1alpha1.WorkloadClassSpec{
+						PodSelector: &metav1.LabelSelector{MatchLabels: matchLabels},
+						DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{
+							MaxNonDisruptionDurationDays: 7,
+							AllowedDisruptionWindows: []workloadsv1alpha1.DisruptionWindow{{
+								Name:      "later",
+								TimeZone:  "UTC",
+								StartTime: now.Add(2 * time.Hour).Format("15:04"),
+								EndTime:   now.Add(3 * time.Hour).Format("15:04"),
+							}},
+						},
+					},
+				})).To(Succeed())
+			}
+			for name, podLabels := range map[string]map[string]string{"web-1": web, "api-1": {"app": "shop"}} {
+				Expect(k8sClient.Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: podLabels},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+				})).To(Succeed())
+			}
+			// eventuallyPDBs waits until the managed PDBs in the namespace are exactly those of the Pods in owners, each
+			// controlled by the given WorkloadClass and closed, and returns their UIDs by Pod name.
+			eventuallyPDBs := func(owners map[string]string) map[string]types.UID {
+				GinkgoHelper()
+				uids := map[string]types.UID{}
+				Eventually(func(g Gomega) {
+					pdbs := &policyv1.PodDisruptionBudgetList{}
+					g.Expect(k8sClient.List(ctx, pdbs, client.InNamespace(ns))).To(Succeed())
+					got := map[string]string{}
+					clear(uids)
+					for _, pdb := range pdbs.Items {
+						podName := utils.PodNameFromPDBName(pdb.Name)
+						got[podName], uids[podName] = metav1.GetControllerOf(&pdb).Name, pdb.UID
+						g.Expect(pdb.Spec.MaxUnavailable.String()).To(Equal("0"), "PDB %s", pdb.Name)
+					}
+					g.Expect(got).To(Equal(owners))
+				}).Should(Succeed())
+				return uids
+			}
+			expectStatus := func(name, validated string) {
+				GinkgoHelper()
+				Eventually(func(g Gomega) {
+					wc := &workloadsv1alpha1.WorkloadClass{}
+					g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, wc)).To(Succeed())
+					g.Expect(meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated)).
+						To(HaveField("Reason", validated))
+					g.Expect(wc.Status.MaintenanceReadiness).To(Equal(workloadsv1alpha1.ReadinessNotReady))
+				}).Should(Succeed())
+			}
+
+			By("calculating the readiness of both WorkloadClasses despite SelectorOverlap")
+			expectStatus("wc-broad", workloadsv1alpha1.ReasonSelectorOverlap)
+			expectStatus("wc-web", workloadsv1alpha1.ReasonSelectorOverlap)
+
+			By("closing the PDB of each Pod, controlled by its best match")
+			before := eventuallyPDBs(map[string]string{"web-1": "wc-web", "api-1": "wc-broad"})
+
+			By("handing the PDB of web-1 back to wc-broad when wc-web is deleted")
+			Expect(k8sClient.Delete(ctx, &workloadsv1alpha1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "wc-web", Namespace: ns},
+			})).To(Succeed())
+			after := eventuallyPDBs(map[string]string{"web-1": "wc-broad", "api-1": "wc-broad"})
+			Expect(after).To(Equal(before))
+			expectStatus("wc-broad", workloadsv1alpha1.ReasonValidationPassed)
 		})
 	})
 })
@@ -1924,11 +2027,41 @@ func TestCalculateReadiness(t *testing.T) {
 			wantReason:    workloadsv1alpha1.ReasonValidationFailed,
 		},
 		{
-			name:          "selector_overlap_is_unknown_with_its_own_reason",
-			wc:            newWC(func(*workloadsv1alpha1.DisruptionPolicy) {}),
+			name: "selector_overlap_is_not_ready_for_a_young_governed_pod",
+			wc: newWC(func(p *workloadsv1alpha1.DisruptionPolicy) {
+				p.MinInitialRunDurationDays = 1
+			}),
+			validated: overlapping,
+			pods: []client.Object{
+				testPod("young", selected, now.Add(-20*time.Hour)),
+				testWorkloadClass("wc-web", "ns", map[string]string{"app": "nginx", "tier": "web"}),
+			},
+			wantReadiness: workloadsv1alpha1.ReadinessNotReady,
+			wantReason:    workloadsv1alpha1.ReasonMinInitialRunDurationNotMet,
+			wantRequeue:   4*time.Hour + transitionRequeueDelay,
+		},
+		{
+			name: "selector_overlap_is_not_blocked_by_young_pods_of_a_more_specific_overlapping_class",
+			wc: newWC(func(p *workloadsv1alpha1.DisruptionPolicy) {
+				p.MinInitialRunDurationDays = 1
+			}),
+			validated: overlapping,
+			pods: []client.Object{
+				testPod("young-web", map[string]string{"app": "nginx", "tier": "web"}, now),
+				testWorkloadClass("wc-web", "ns", map[string]string{"app": "nginx", "tier": "web"}),
+			},
+			wantReadiness: workloadsv1alpha1.ReadinessReady,
+			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
+		},
+		{
+			name: "selector_overlap_is_not_ready_outside_of_windows",
+			wc: newWC(func(p *workloadsv1alpha1.DisruptionPolicy) {
+				p.AllowedDisruptionWindows = []workloadsv1alpha1.DisruptionWindow{closedWindow}
+			}),
 			validated:     overlapping,
-			wantReadiness: workloadsv1alpha1.ReadinessUnknown,
-			wantReason:    workloadsv1alpha1.ReasonSelectorOverlap,
+			wantReadiness: workloadsv1alpha1.ReadinessNotReady,
+			wantReason:    workloadsv1alpha1.ReasonOutsideDisruptionWindow,
+			wantRequeue:   10*time.Hour + transitionRequeueDelay,
 		},
 		{
 			name: "emergency_override_is_ready_outside_of_windows",
@@ -2556,6 +2689,13 @@ func TestReconcilePDBs(t *testing.T) {
 	deletingEnforcedWC := enforcedWC(passed, other)
 	deletingEnforcedWC.DeletionTimestamp = ptr.To(metav1.Now())
 	deletingEnforcedWC.Finalizers = []string{"workloads.x-k8s.io/test"}
+	// overlap is the Validated condition of WorkloadClasses whose PodSelectors overlap, such as wc and wc-web.
+	overlap := validated(metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
+	overlapWC := notReadyWC.DeepCopy()
+	overlapWC.Status.Conditions = []metav1.Condition{overlap}
+	deletingOverlapWebWC := webWC(overlap)
+	deletingOverlapWebWC.DeletionTimestamp = ptr.To(metav1.Now())
+	deletingOverlapWebWC.Finalizers = []string{"workloads.x-k8s.io/test"}
 
 	// wantPDB is the expected controller and maxUnavailable of a PDB. An empty owner means a PDB that is not managed
 	// by a WorkloadClass and must be left untouched. leftAlone means a PDB that the reconciled WorkloadClass controls
@@ -2572,6 +2712,8 @@ func TestReconcilePDBs(t *testing.T) {
 		wantErr   string
 		wantPDBs  map[string]*wantPDB // PDB name -> expected PDB, or nil if it must not exist
 		unlabeled []string            // Pods that must not get the PodUIDLabel label
+		// noGuardrails reconciles as if no WorkloadClassGuardrail exists.
+		noGuardrails bool
 	}{
 		{
 			name:      "not_ready_class_creates_closed_pdbs_for_governed_pods",
@@ -2697,11 +2839,12 @@ func TestReconcilePDBs(t *testing.T) {
 			wantPDBs:  map[string]*wantPDB{"workload-web-0": {owner: "wc", maxUnavailable: "0"}},
 		},
 		{
-			name:      "no_guardrails_creates_none",
-			wc:        readyWC,
-			validated: validated(metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails),
-			objects:   []client.Object{testPDBPod("web-1", nginx)},
-			wantPDBs:  map[string]*wantPDB{"workload-web-1": nil},
+			name:         "no_guardrails_creates_none",
+			wc:           readyWC,
+			validated:    validated(metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails),
+			objects:      []client.Object{testPDBPod("web-1", nginx)},
+			wantPDBs:     map[string]*wantPDB{"workload-web-1": nil},
+			noGuardrails: true,
 		},
 		{
 			name:      "user_pdb_with_the_same_name_that_does_not_cover_the_pod_skips_it",
@@ -2950,6 +3093,59 @@ func TestReconcilePDBs(t *testing.T) {
 			},
 			wantPDBs: map[string]*wantPDB{"workload-web-1": {owner: "wc", maxUnavailable: "0"}},
 		},
+		{
+			name:      "overlapping_class_protects_the_pods_it_is_the_best_match_for_and_leaves_the_others",
+			wc:        overlapWC,
+			validated: overlap,
+			objects: []client.Object{
+				webWC(overlap), webPod, testPDBPod("web-2", nginx), testOwnedPDB(overlapWC, webPod, closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc", maxUnavailable: "0", leftAlone: true},
+				"workload-web-2": {owner: "wc", maxUnavailable: "0"},
+			},
+			unlabeled: []string{"web-1"},
+		},
+		{
+			name:      "more_specific_overlapping_class_takes_over_the_pdbs_of_the_pods_it_is_the_best_match_for",
+			wc:        webWC(overlap),
+			validated: overlap,
+			objects:   []client.Object{overlapWC, webPod, testPDBPod("web-2", nginx), testOwnedPDB(overlapWC, webPod, open)},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc-web", maxUnavailable: "0"},
+				"workload-web-2": nil,
+			},
+			unlabeled: []string{"web-2"},
+		},
+		{
+			// wc still overlaps with another WorkloadClass, e.g. a third one.
+			name:      "overlapping_class_takes_the_pdb_back_when_the_more_specific_class_is_deleting",
+			wc:        overlapWC,
+			validated: overlap,
+			objects:   []client.Object{deletingOverlapWebWC, webPod, testOwnedPDB(deletingOverlapWebWC, webPod, closed)},
+			wantPDBs:  map[string]*wantPDB{"workload-web-1": {owner: "wc", maxUnavailable: "0"}},
+		},
+		{
+			name:         "overlapping_class_without_guardrails_opens_owned_pdbs_and_creates_none",
+			wc:           overlapWC,
+			validated:    overlap,
+			noGuardrails: true,
+			objects: []client.Object{
+				testPDBPod("web-1", nginx), testPDBPod("web-2", nginx), testOwnedPDB(overlapWC, testPDBPod("web-1", nginx), closed),
+			},
+			wantPDBs: map[string]*wantPDB{
+				"workload-web-1": {owner: "wc", maxUnavailable: "100%"},
+				"workload-web-2": nil,
+			},
+		},
+		{
+			name:         "pdb_is_opened_rather_than_left_for_a_more_specific_overlapping_class_without_guardrails",
+			wc:           overlapWC,
+			validated:    overlap,
+			noGuardrails: true,
+			objects:      []client.Object{webWC(overlap), webPod, testOwnedPDB(overlapWC, webPod, closed)},
+			wantPDBs:     map[string]*wantPDB{"workload-web-1": {owner: "wc", maxUnavailable: "100%"}},
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2957,7 +3153,7 @@ func TestReconcilePDBs(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.objects...).Build()
 			r := &WorkloadClassReconciler{Client: c, Scheme: scheme}
 
-			err := r.reconcilePDBs(t.Context(), tc.wc, tc.validated)
+			err := r.reconcilePDBs(t.Context(), tc.wc, tc.validated, !tc.noGuardrails)
 			if tc.wantErr == "" && err != nil {
 				t.Fatalf("reconcilePDBs() returned unexpected error: %v", err)
 			}
@@ -3009,7 +3205,7 @@ func TestReconcilePDBs(t *testing.T) {
 				if p := pdb.Spec.UnhealthyPodEvictionPolicy; p == nil || *p != policyv1.AlwaysAllow {
 					t.Errorf("PDB %s: unhealthyPodEvictionPolicy = %v, want %s", name, p, policyv1.AlwaysAllow)
 				}
-				if protectsPods(tc.validated) && pod.Labels[workloadsv1alpha1.PodUIDLabel] != string(pod.UID) {
+				if protectsPods(tc.validated, !tc.noGuardrails) && pod.Labels[workloadsv1alpha1.PodUIDLabel] != string(pod.UID) {
 					t.Errorf("Pod %s: labels = %v, want %s=%s", pod.Name, pod.Labels, workloadsv1alpha1.PodUIDLabel, pod.UID)
 				}
 			}
@@ -3156,6 +3352,38 @@ func TestWorkloadClassesForPod(t *testing.T) {
 	}
 }
 
+func TestProtectsPods(t *testing.T) {
+	testCases := []struct {
+		status                       metav1.ConditionStatus
+		reason                       string
+		withGuardrails, noGuardrails bool
+	}{
+		{status: metav1.ConditionTrue, reason: workloadsv1alpha1.ReasonValidationPassed, withGuardrails: true},
+		{status: metav1.ConditionFalse, reason: workloadsv1alpha1.ReasonSelectorOverlap, withGuardrails: true},
+		{status: metav1.ConditionTrue, reason: workloadsv1alpha1.ReasonNoGuardrails},
+		{status: metav1.ConditionFalse, reason: workloadsv1alpha1.ReasonValidationFailed},
+		{status: metav1.ConditionUnknown},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.reason+"_"+string(tc.status), func(t *testing.T) {
+			wc := testWorkloadClass("wc", "ns", nil)
+			cond := metav1.Condition{Type: workloadsv1alpha1.ConditionTypeValidated, Status: tc.status, Reason: tc.reason}
+			wc.Status.Conditions = []metav1.Condition{cond}
+			for hasGuardrails, want := range map[bool]bool{true: tc.withGuardrails, false: tc.noGuardrails} {
+				if got := protectsPods(cond, hasGuardrails); got != want {
+					t.Errorf("protectsPods(%s, hasGuardrails=%v) = %v, want %v", tc.reason, hasGuardrails, got, want)
+				}
+				if got := statusProtectsPods(wc, hasGuardrails); got != want {
+					t.Errorf("statusProtectsPods(%s, hasGuardrails=%v) = %v, want %v", tc.reason, hasGuardrails, got, want)
+				}
+			}
+		})
+	}
+	if statusProtectsPods(testWorkloadClass("wc", "ns", nil), true) {
+		t.Error("statusProtectsPods() = true for a WorkloadClass without a Validated condition, want false")
+	}
+}
+
 func TestProtectionChangedPredicate(t *testing.T) {
 	withValidated := func(status metav1.ConditionStatus, reason string) *workloadsv1alpha1.WorkloadClass {
 		wc := testWorkloadClass("wc", "ns", nil)
@@ -3164,6 +3392,7 @@ func TestProtectionChangedPredicate(t *testing.T) {
 	}
 	passed := withValidated(metav1.ConditionTrue, workloadsv1alpha1.ReasonValidationPassed)
 	failed := withValidated(metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
+	overlap := withValidated(metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
 	ready := passed.DeepCopy()
 	ready.Status.MaintenanceReadiness = workloadsv1alpha1.ReadinessReady
 
@@ -3176,6 +3405,8 @@ func TestProtectionChangedPredicate(t *testing.T) {
 		{name: "stops_protecting", oldWC: passed, newWC: failed, want: true},
 		{name: "other_status_change", oldWC: passed, newWC: ready, want: false},
 		{name: "stays_unprotected", oldWC: failed, newWC: withValidated(metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails), want: false},
+		{name: "overlap_starts_protecting", oldWC: failed, newWC: overlap, want: true},
+		{name: "overlap_keeps_protecting", oldWC: passed, newWC: overlap, want: false},
 	}
 	p := protectionChangedPredicate()
 	for _, tc := range testCases {

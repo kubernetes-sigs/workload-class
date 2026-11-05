@@ -22,13 +22,14 @@ import (
 	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	workloadsv1alpha1 "sigs.k8s.io/workload-class/api/v1alpha1"
+	"sigs.k8s.io/workload-class/internal/utils"
 )
 
 const conditionTypeMaintenanceAllowed = "MaintenanceAllowed"
@@ -69,12 +70,13 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 
 	log = log.WithValues("workloadClass", bestWC.Name)
 
-	// 4. Check Guardrail/spec validation (if it fails, we don't enforce constraints)
-	for _, cond := range bestWC.Status.Conditions {
-		if cond.Type == workloadsv1alpha1.ConditionTypeValidated && cond.Status == metav1.ConditionFalse {
-			log.Info("WorkloadClass failed Guardrail validation, ignoring constraints")
-			return admission.Allowed("WorkloadClass failed Guardrail validation")
-		}
+	// 4. Check Guardrail/spec validation (if it fails, we don't enforce constraints). A WorkloadClass whose PodSelector
+	// only overlaps with another one is still enforced for the Pods it is the best match for (see utils.IsValidated),
+	// like its Per-Pod PodDisruptionBudgets.
+	cond := meta.FindStatusCondition(bestWC.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated)
+	if cond != nil && !utils.IsValidated(cond) {
+		log.Info("WorkloadClass failed Guardrail validation, ignoring constraints")
+		return admission.Allowed("WorkloadClass failed Guardrail validation")
 	}
 
 	// 5. Request-specific check: Identity-Based Filtering

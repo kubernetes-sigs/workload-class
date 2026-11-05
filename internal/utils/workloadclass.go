@@ -67,6 +67,15 @@ func NamespaceEnforcedWorkloadClass(
 	return wc, true, nil
 }
 
+// IsValidated reports whether a WorkloadClass with the given Validated condition enforces its disruption policy: the
+// condition is True, or its only problem is that the PodSelector overlaps with another WorkloadClass
+// (ReasonSelectorOverlap). Overlapping WorkloadClasses still apply to the Pods they are the best match for (see
+// SelectorBestMatch), so they keep protecting them. A nil condition (not validated yet) is not validated.
+func IsValidated(cond *metav1.Condition) bool {
+	return cond != nil &&
+		(cond.Status == metav1.ConditionTrue || cond.Reason == workloadsv1alpha1.ReasonSelectorOverlap)
+}
+
 // IsPodActive reports whether the Pod is active: it is not terminating and has not reached a terminal phase
 // (Succeeded or Failed). Only active Pods get a Per-Pod PodDisruptionBudget.
 func IsPodActive(pod *corev1.Pod) bool {

@@ -55,6 +55,9 @@ func TestHandle(t *testing.T) {
 			Conditions: []metav1.Condition{{Type: workloadsv1alpha1.ConditionTypeValidated, Status: metav1.ConditionFalse}},
 		},
 	}
+	// wcOverlap only fails validation because its PodSelector overlaps with another WorkloadClass, so it is enforced.
+	wcOverlap := wcValFailed.DeepCopy()
+	wcOverlap.Status.Conditions[0].Reason = workloadsv1alpha1.ReasonSelectorOverlap
 	wcNotReadyWithCondition := &workloadsv1alpha1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: testNamespace},
 		Spec:       workloadsv1alpha1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: labels}},
@@ -143,6 +146,16 @@ func TestHandle(t *testing.T) {
 			name: "ready", req: evictionRequestNonMatchingUser, getWCResp: wc,
 			readiness: workloadsv1alpha1.ReadinessReady,
 			want:      admission.Allowed("Eviction allowed by WorkloadClass policy"),
+		},
+		{
+			name: "selectorOverlapNotReady", req: evictionRequestNonMatchingUser,
+			getWCResp: wcOverlap, readiness: workloadsv1alpha1.ReadinessNotReady,
+			want: admission.Denied(fmt.Sprintf("Eviction blocked: WorkloadClass %s is not ready for maintenance", wc.Name)),
+		},
+		{
+			name: "selectorOverlapReady", req: evictionRequestNonMatchingUser,
+			getWCResp: wcOverlap, readiness: workloadsv1alpha1.ReadinessReady,
+			want: admission.Allowed("Eviction allowed by WorkloadClass policy"),
 		},
 	}
 

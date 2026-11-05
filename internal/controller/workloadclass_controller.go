@@ -59,13 +59,12 @@ const (
 	maxConditionMessageLen = 32768
 	maxReportedOverlaps    = 5
 
-	notValidatedMsg             = "Maintenance readiness cannot be determined because the WorkloadClass failed validation; see the Validated condition"
-	selectorOverlapReadinessMsg = "Maintenance readiness cannot be determined because the `podSelector` overlaps with another WorkloadClass; see the Validated condition"
-	emergencyOverrideMsg        = "`emergencyOverride` is set, so maintenance can disrupt Pods at any time"
-	overdueMsg                  = "The workload has remained undisrupted for at least `maxNonDisruptionDurationDays`, so maintenance takes precedence"
-	noWindowsMsg                = "No `allowedDisruptionWindows` are defined, so maintenance can disrupt Pods at any time"
-	withinWindowMsg             = "The current time is within an allowed disruption window"
-	outsideWindowMsg            = "The current time is outside of every allowed disruption window"
+	notValidatedMsg      = "Maintenance readiness cannot be determined because the WorkloadClass failed validation; see the Validated condition"
+	emergencyOverrideMsg = "`emergencyOverride` is set, so maintenance can disrupt Pods at any time"
+	overdueMsg           = "The workload has remained undisrupted for at least `maxNonDisruptionDurationDays`, so maintenance takes precedence"
+	noWindowsMsg         = "No `allowedDisruptionWindows` are defined, so maintenance can disrupt Pods at any time"
+	withinWindowMsg      = "The current time is within an allowed disruption window"
+	outsideWindowMsg     = "The current time is outside of every allowed disruption window"
 
 	// transitionRequeueDelay is added to requeues scheduled at a readiness transition, such as a disruption window
 	// opening or closing, so that the reconcile runs just after the transition and observes the new readiness.
@@ -144,7 +143,7 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	pdbErr := r.reconcilePDBs(ctx, wc, cond)
+	pdbErr := r.reconcilePDBs(ctx, wc, cond, len(guardrails.Items) > 0)
 	if pdbErr != nil {
 		log.Error(pdbErr, "Failed to reconcile PodDisruptionBudgets")
 	}
@@ -161,7 +160,8 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // If the only problem is that the PodSelector overlaps with other WorkloadClasses in the namespace,
 // ReasonSelectorOverlap is used instead. Overlap is intentionally reported symmetrically on every
 // WorkloadClass involved so that any affected workload owner sees the conflict, while keeping a
-// distinct Reason from ReasonValidationFailed.
+// distinct Reason from ReasonValidationFailed. Overlapping WorkloadClasses still enforce their disruption
+// policy over the Pods they are the best match for (see utils.IsValidated), so ties are broken per Pod.
 func validatedCondition(
 	wc *workloadsv1alpha1.WorkloadClass,
 	guardrails []workloadsv1alpha1.WorkloadClassGuardrail,
@@ -392,7 +392,9 @@ func (r readinessResult) condition(generation int64) metav1.Condition {
 // calculateReadiness calculates the MaintenanceReadiness of the WorkloadClass at the current time, and when it should
 // next be re-evaluated. In order of precedence, the WorkloadClass is:
 //
-//  1. Unknown if it is not validated, since its disruption policy is not enforced.
+//  1. Unknown if it failed validation, since its disruption policy is not enforced (see utils.IsValidated). A
+//     WorkloadClass whose PodSelector overlaps with another one (ReasonSelectorOverlap) is still evaluated, over the
+//     Pods it governs (see governedPods), so overlapping WorkloadClasses split their Pods by best match.
 //  2. Ready if EmergencyOverride is set.
 //  3. Overdue if it has remained undisrupted for at least MaxNonDisruptionDurationDays.
 //  4. NotReady if the current time is outside of every AllowedDisruptionWindow.
@@ -409,15 +411,11 @@ func (r readinessResult) condition(generation int64) metav1.Condition {
 func (r *WorkloadClassReconciler) calculateReadiness(
 	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, validated metav1.Condition,
 ) (readinessResult, error) {
-	if validated.Status != metav1.ConditionTrue {
-		message := notValidatedMsg
-		if validated.Reason == workloadsv1alpha1.ReasonSelectorOverlap {
-			message = selectorOverlapReadinessMsg
-		}
+	if !utils.IsValidated(&validated) {
 		return readinessResult{
 			readiness: workloadsv1alpha1.ReadinessUnknown,
 			reason:    validated.Reason,
-			message:   message,
+			message:   notValidatedMsg,
 		}, nil
 	}
 
@@ -552,18 +550,21 @@ func (r *WorkloadClassReconciler) bestMatchCandidates(
 // protectsPods reports whether a WorkloadClass with the given Validated condition protects the Pods it governs with
 // Per-Pod PodDisruptionBudgets that follow its MaintenanceReadiness.
 //
-// Only a WorkloadClass that passed validation against at least one guardrail does (ReasonValidationPassed, since
-// ReasonNoGuardrails is reported when no guardrail exists), so that PDBs block disruptions only where a guardrail
-// bounds the disruption policy, e.g. through maxNonDisruptionDurationDays.
-func protectsPods(validated metav1.Condition) bool {
-	return validated.Status == metav1.ConditionTrue && validated.Reason == workloadsv1alpha1.ReasonValidationPassed
+// A WorkloadClass does if it enforces its disruption policy (see utils.IsValidated: it passed validation, or its
+// PodSelector only overlaps with another WorkloadClass) and at least one guardrail exists (hasGuardrails), so that
+// PDBs block disruptions only where a guardrail bounds the disruption policy, e.g. through
+// maxNonDisruptionDurationDays. Overlapping WorkloadClasses keep protecting the Pods they are the best match for, so
+// each Pod's PDB is owned by its best match (see governedPods).
+func protectsPods(validated metav1.Condition, hasGuardrails bool) bool {
+	return hasGuardrails && utils.IsValidated(&validated) && validated.Reason != workloadsv1alpha1.ReasonNoGuardrails
 }
 
 // statusProtectsPods reports whether the Validated condition in the status of the WorkloadClass shows that it protects
-// the Pods it governs (see protectsPods).
-func statusProtectsPods(wc *workloadsv1alpha1.WorkloadClass) bool {
+// the Pods it governs (see protectsPods). Guardrails are cluster-scoped, so hasGuardrails is the same for every
+// WorkloadClass.
+func statusProtectsPods(wc *workloadsv1alpha1.WorkloadClass, hasGuardrails bool) bool {
 	validated := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated)
-	return validated != nil && protectsPods(*validated)
+	return validated != nil && protectsPods(*validated, hasGuardrails)
 }
 
 // reconcilePDBs reconciles the Per-Pod PodDisruptionBudgets (see utils.PDBName) of the Pods governed by the
@@ -591,8 +592,10 @@ func statusProtectsPods(wc *workloadsv1alpha1.WorkloadClass) bool {
 //
 // A WorkloadClass that is being deleted is skipped, since its PDBs are garbage collected through their owner
 // references. An error for one Pod does not stop the others; all errors are returned.
+//
+// hasGuardrails reports whether at least one WorkloadClassGuardrail exists (see protectsPods).
 func (r *WorkloadClassReconciler) reconcilePDBs(
-	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, validated metav1.Condition,
+	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, validated metav1.Condition, hasGuardrails bool,
 ) error {
 	if !wc.DeletionTimestamp.IsZero() {
 		return nil
@@ -610,8 +613,8 @@ func (r *WorkloadClassReconciler) reconcilePDBs(
 			userPDBs = append(userPDBs, *pdb)
 		}
 	}
-	if !protectsPods(validated) {
-		return r.reconcileOwnedPDBs(ctx, wc, owned, userPDBs, nil, true)
+	if !protectsPods(validated, hasGuardrails) {
+		return r.reconcileOwnedPDBs(ctx, wc, owned, userPDBs, nil, true, hasGuardrails)
 	}
 
 	pods, err := r.governedPods(ctx, wc)
@@ -637,7 +640,7 @@ func (r *WorkloadClassReconciler) reconcilePDBs(
 			errs = append(errs, err)
 		}
 	}
-	errs = append(errs, r.reconcileOwnedPDBs(ctx, wc, owned, userPDBs, protected, false))
+	errs = append(errs, r.reconcileOwnedPDBs(ctx, wc, owned, userPDBs, protected, false, hasGuardrails))
 	return errors.Join(errs...)
 }
 
@@ -650,9 +653,11 @@ func (r *WorkloadClassReconciler) reconcilePDBs(
 //     WorkloadClass to take over (see claimPDB).
 //   - Otherwise, the PDB is opened (MaxUnavailable = 100%) if open is true, or deleted, since no WorkloadClass that
 //     protects Pods governs its Pod anymore (e.g. the Pod was relabeled).
+//
+// hasGuardrails reports whether at least one WorkloadClassGuardrail exists (see statusProtectsPods).
 func (r *WorkloadClassReconciler) reconcileOwnedPDBs(
 	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, owned, userPDBs []policyv1.PodDisruptionBudget,
-	protected sets.Set[string], open bool,
+	protected sets.Set[string], open, hasGuardrails bool,
 ) error {
 	if len(owned) == 0 {
 		return nil
@@ -679,7 +684,7 @@ func (r *WorkloadClassReconciler) reconcileOwnedPDBs(
 		}
 		if utils.IsPodActive(pod) && !utils.IsPodCoveredByUserPDB(pod, userPDBs) {
 			bestMatch := utils.BestMatchWorkloadClassForPod(pod, enforcedWC, enforced, candidates)
-			if bestMatch != nil && bestMatch.Name != wc.Name && statusProtectsPods(bestMatch) {
+			if bestMatch != nil && bestMatch.Name != wc.Name && statusProtectsPods(bestMatch, hasGuardrails) {
 				continue
 			}
 			if open {
@@ -1049,12 +1054,15 @@ func lastDisruptionTimeChangedPredicate() predicate.Funcs {
 
 // protectionChangedPredicate passes WorkloadClass updates after which its status shows that it started or stopped
 // protecting the Pods it governs (see statusProtectsPods). Creation, deletion, and generic events pass through.
+//
+// It assumes that a guardrail exists: without one, no WorkloadClass protects Pods, so the extra events it passes then
+// are harmless, and creating or deleting a guardrail re-reconciles every WorkloadClass anyway.
 func protectionChangedPredicate() predicate.Funcs {
 	return predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldWC, okOld := e.ObjectOld.(*workloadsv1alpha1.WorkloadClass)
 			newWC, okNew := e.ObjectNew.(*workloadsv1alpha1.WorkloadClass)
-			return okOld && okNew && statusProtectsPods(oldWC) != statusProtectsPods(newWC)
+			return okOld && okNew && statusProtectsPods(oldWC, true) != statusProtectsPods(newWC, true)
 		},
 	}
 }
