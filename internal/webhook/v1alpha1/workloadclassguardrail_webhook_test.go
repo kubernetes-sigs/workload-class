@@ -145,7 +145,7 @@ var _ = Describe("WorkloadClassGuardrail Webhook", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(warnings).NotTo(BeEmpty())
 			Expect(warnings[0]).To(ContainSubstring("unset-fields-workloadclass"))
-			Expect(warnings[0]).To(ContainSubstring("omits allowedDisruptionWindows"))
+			Expect(warnings[0]).To(ContainSubstring("`allowedDisruptionWindows` must be specified"))
 			Expect(warnings[0]).To(ContainSubstring("0 means no limit"))
 		})
 
