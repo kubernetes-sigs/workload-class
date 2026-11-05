@@ -19,7 +19,7 @@ package v1alpha1
 import (
 	"context"
 	"fmt"
-	"time"
+	"strings"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,16 +29,6 @@ import (
 	workloadsv1alpha1 "sigs.k8s.io/workload-class/api/v1alpha1"
 	"sigs.k8s.io/workload-class/internal/utils"
 )
-
-var allWeekdays = []string{
-	time.Sunday.String(),
-	time.Monday.String(),
-	time.Tuesday.String(),
-	time.Wednesday.String(),
-	time.Thursday.String(),
-	time.Friday.String(),
-	time.Saturday.String(),
-}
 
 // nolint:unused
 var workloadclassguardraillog = logf.Log.WithName("workloadclassguardrail-resource")
@@ -94,9 +84,10 @@ func (v *WorkloadClassGuardrailCustomValidator) validateAgainstWorkloadClasses(c
 
 	var warnings admission.Warnings
 	for _, wc := range wcs.Items {
-		if violations := v.violatesGuardrail(&wc, g); len(violations) > 0 {
+		if violations := utils.GuardrailViolations(&wc, g); len(violations) > 0 {
 			workloadclassguardraillog.Info("Existing WorkloadClass violates guardrail", "violations", violations, "workloadclass", wc.Name, "namespace", wc.Namespace)
-			warnings = append(warnings, fmt.Sprintf("existing WorkloadClass \"%s/%s\" violates guardrail: %v", wc.Namespace, wc.Name, violations))
+			warnings = append(warnings, fmt.Sprintf("existing WorkloadClass '%s/%s' does not comply with this guardrail: %s",
+				wc.Namespace, wc.Name, strings.Join(violations, "; ")))
 		}
 	}
 
@@ -106,42 +97,4 @@ func (v *WorkloadClassGuardrailCustomValidator) validateAgainstWorkloadClasses(c
 
 	workloadclassguardraillog.Info("WorkloadClassGuardrail is valid for all WorkloadClasses", "name", g.GetName())
 	return nil, nil
-}
-
-// violatesGuardrail checks if a WorkloadClass violates the given WorkloadClassGuardrail.
-func (v *WorkloadClassGuardrailCustomValidator) violatesGuardrail(wc *workloadsv1alpha1.WorkloadClass, g *workloadsv1alpha1.WorkloadClassGuardrail) []string {
-	var (
-		daysOfWeek                   = g.Spec.Constraints.Disruption.DaysOfWeek
-		maxAllowedWindows            = g.Spec.Constraints.Disruption.MaxAllowedWindows
-		maxNonDisruptionDurationDays = g.Spec.Constraints.Disruption.MaxNonDisruptionDurationDays
-		violations                   = []string{}
-	)
-
-	if len(daysOfWeek) > 0 {
-		if len(wc.Spec.DisruptionPolicy.AllowedDisruptionWindows) == 0 {
-			if !utils.IsSubset(allWeekdays, daysOfWeek) {
-				violations = append(violations, fmt.Sprintf("guardrail limits disruption days to %v, but existing WorkloadClass '%s' omits allowedDisruptionWindows (allowing disruption on all days)", daysOfWeek, wc.Name))
-			}
-		} else {
-			for _, dw := range wc.Spec.DisruptionPolicy.AllowedDisruptionWindows {
-				windowDays := dw.DaysOfWeek
-				if len(windowDays) == 0 {
-					windowDays = allWeekdays
-				}
-				if !utils.IsSubset(windowDays, daysOfWeek) {
-					violations = append(violations, fmt.Sprintf("guardrail limits disruption days to %v, but existing WorkloadClass '%s' requires %v", daysOfWeek, wc.Name, windowDays))
-				}
-			}
-		}
-	}
-
-	if maxAllowedWindows > 0 && len(wc.Spec.DisruptionPolicy.AllowedDisruptionWindows) > int(maxAllowedWindows) {
-		violations = append(violations, fmt.Sprintf("guardrail limits number AllowedDisruptionWindows to %d, but existing WorkloadClass '%s' requires %d", maxAllowedWindows, wc.Name, len(wc.Spec.DisruptionPolicy.AllowedDisruptionWindows)))
-	}
-
-	if maxNonDisruptionDurationDays > 0 && (wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays <= 0 || wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays > maxNonDisruptionDurationDays) {
-		violations = append(violations, fmt.Sprintf("guardrail limits MaxNonDisruptionDurationDays to %d, but existing WorkloadClass '%s' requires %d (0 means no limit)", maxNonDisruptionDurationDays, wc.Name, wc.Spec.DisruptionPolicy.MaxNonDisruptionDurationDays))
-	}
-
-	return violations
 }

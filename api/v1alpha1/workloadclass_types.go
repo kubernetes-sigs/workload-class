@@ -78,7 +78,7 @@ type DisruptionWindow struct {
 	// +optional
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^([A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}|UTC|GMT)$`
-	// +kubebuilder:validation:XValidation:rule="self != 'Local' && self != 'local'",message="timeZone cannot be Local"
+	// +kubebuilder:validation:XValidation:rule="self != 'Local' && self != 'local'",message="must not be 'Local' or 'local'"
 	TimeZone string `json:"timeZone,omitempty"`
 
 	// StartTime is the start time of the window in HH:MM format (e.g. 22:00) in the specified timeZone (or UTC if timeZone is omitted).
