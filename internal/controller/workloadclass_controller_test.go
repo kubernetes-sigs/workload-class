@@ -103,17 +103,23 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(k8sClient.Update(ctx, wc)).To(Succeed())
 		}
 
-		reconcileAndGetValidated := func(name string) *metav1.Condition {
+		reconcileAndGetCondition := func(name, condType string) *metav1.Condition {
 			key := types.NamespacedName{Name: name, Namespace: namespace}
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
 			Expect(err).NotTo(HaveOccurred())
 
 			wc := &workloadsv1alpha1.WorkloadClass{}
 			Expect(k8sClient.Get(ctx, key, wc)).To(Succeed())
-			cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated)
+			cond := meta.FindStatusCondition(wc.Status.Conditions, condType)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.ObservedGeneration).To(Equal(wc.Generation))
 			return cond
+		}
+		reconcileAndGetValidated := func(name string) *metav1.Condition {
+			return reconcileAndGetCondition(name, workloadsv1alpha1.ConditionTypeValidated)
+		}
+		reconcileAndGetOverlap := func(name string) *metav1.Condition {
+			return reconcileAndGetCondition(name, workloadsv1alpha1.ConditionTypePodSelectorOverlap)
 		}
 
 		BeforeEach(func() {
@@ -277,49 +283,54 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(cond.Message).To(ContainSubstring("disruption window 'funday': `daysOfWeek` must only contain"))
 		})
 
-		It("should surface SelectorOverlap when another WorkloadClass has an overlapping PodSelector", func() {
+		It("should surface PodSelectorOverlap without failing validation when another WorkloadClass has an overlapping PodSelector", func() {
 			const otherName = "test-workloadclass-overlapping-selector"
 			other := newWorkloadClass(otherName)
 			other.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test", "tier": "web"}}
 			Expect(k8sClient.Create(ctx, other)).To(Succeed())
 
-			By("marking both WorkloadClasses with SelectorOverlap")
-			cond := reconcileAndGetValidated(workloadClassName)
-			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			By("marking both WorkloadClasses with PodSelectorOverlap=True while keeping them Validated")
+			cond := reconcileAndGetOverlap(workloadClassName)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonSelectorOverlap))
 			Expect(cond.Message).To(Equal(fmt.Sprintf(
-				"`podSelector` must not select the same Pods as another WorkloadClass in the namespace, "+
-					"but it overlaps with the `podSelector` of '%s'", otherName)))
+				"`podSelector` may select the same Pods as the `podSelector` of '%s'; "+
+					"a Pod selected by more than one WorkloadClass is governed by the oldest of them", otherName)))
+			cond = reconcileAndGetValidated(workloadClassName)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonNoGuardrails))
 
-			cond = reconcileAndGetValidated(otherName)
-			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			cond = reconcileAndGetOverlap(otherName)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonSelectorOverlap))
+			cond = reconcileAndGetValidated(otherName)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 
-			By("clearing SelectorOverlap once the selectors no longer overlap")
+			By("clearing PodSelectorOverlap once the selectors no longer overlap")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: otherName, Namespace: namespace}, other)).To(Succeed())
 			other.Spec.PodSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"app": "other"}}
 			Expect(k8sClient.Update(ctx, other)).To(Succeed())
 
-			cond = reconcileAndGetValidated(workloadClassName)
-			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonNoGuardrails))
+			cond = reconcileAndGetOverlap(workloadClassName)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonNoSelectorOverlap))
 
-			By("clearing SelectorOverlap when the overlapping WorkloadClass is deleted")
+			By("clearing PodSelectorOverlap when the overlapping WorkloadClass is deleted")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: otherName, Namespace: namespace}, other)).To(Succeed())
 			other.Spec.PodSelector = podSelector.DeepCopy()
 			Expect(k8sClient.Update(ctx, other)).To(Succeed())
 
-			cond = reconcileAndGetValidated(workloadClassName)
-			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			cond = reconcileAndGetOverlap(workloadClassName)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonSelectorOverlap))
 
 			Expect(k8sClient.Delete(ctx, other)).To(Succeed())
-			cond = reconcileAndGetValidated(workloadClassName)
-			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonNoGuardrails))
+			cond = reconcileAndGetOverlap(workloadClassName)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonNoSelectorOverlap))
 		})
 
-		It("should report guardrail violations and selector overlap together as ValidationFailed", func() {
+		It("should report guardrail violations in Validated and selector overlap in PodSelectorOverlap", func() {
 			createDefaultGuardrail()
 			Expect(k8sClient.Create(ctx, newWorkloadClass("test-workloadclass-same-selector"))).To(Succeed())
 			updateWorkloadClass(func(wc *workloadsv1alpha1.WorkloadClass) {
@@ -330,7 +341,12 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonValidationFailed))
 			Expect(cond.Message).To(ContainSubstring("`maxNonDisruptionDurationDays` must be between 1 and 3, inclusive (guardrail limit), got 5"))
-			Expect(cond.Message).To(ContainSubstring("overlaps with the `podSelector` of 'test-workloadclass-same-selector'"))
+			Expect(cond.Message).NotTo(ContainSubstring("podSelector"))
+
+			cond = reconcileAndGetOverlap(workloadClassName)
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(workloadsv1alpha1.ReasonSelectorOverlap))
+			Expect(cond.Message).To(ContainSubstring("the `podSelector` of 'test-workloadclass-same-selector'"))
 		})
 	})
 
@@ -379,17 +395,23 @@ var _ = Describe("WorkloadClass Controller", func() {
 			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, g))).To(Succeed())
 		})
 
-		eventuallyCondition := func(name string, status metav1.ConditionStatus, reason string) {
+		eventuallyTypedCondition := func(name, condType string, status metav1.ConditionStatus, reason string) {
 			key := types.NamespacedName{Name: name, Namespace: namespace}
 			Eventually(func(g Gomega) {
 				wc := &workloadsv1alpha1.WorkloadClass{}
 				g.Expect(k8sClient.Get(ctx, key, wc)).To(Succeed())
-				cond := meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated)
+				cond := meta.FindStatusCondition(wc.Status.Conditions, condType)
 				g.Expect(cond).NotTo(BeNil())
 				g.Expect(cond.ObservedGeneration).To(Equal(wc.Generation))
 				g.Expect(cond.Status).To(Equal(status))
 				g.Expect(cond.Reason).To(Equal(reason))
 			}).Should(Succeed())
+		}
+		eventuallyCondition := func(name string, status metav1.ConditionStatus, reason string) {
+			eventuallyTypedCondition(name, workloadsv1alpha1.ConditionTypeValidated, status, reason)
+		}
+		eventuallyOverlap := func(name string, status metav1.ConditionStatus, reason string) {
+			eventuallyTypedCondition(name, workloadsv1alpha1.ConditionTypePodSelectorOverlap, status, reason)
 		}
 
 		It("should not re-queue WorkloadClasses on a guardrail status-only update, and should re-queue on a spec update", func() {
@@ -447,7 +469,7 @@ var _ = Describe("WorkloadClass Controller", func() {
 			eventuallyCondition(wcName, metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
 		})
 
-		It("should clear SelectorOverlap on the remaining WorkloadClass when the overlapping WorkloadClass is deleted", func() {
+		It("should clear PodSelectorOverlap on the remaining WorkloadClass when the overlapping WorkloadClass is deleted", func() {
 			for _, name := range []string{"wc-overlap-a", "wc-overlap-b"} {
 				wc := &workloadsv1alpha1.WorkloadClass{
 					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
@@ -461,15 +483,17 @@ var _ = Describe("WorkloadClass Controller", func() {
 				Expect(k8sClient.Create(ctx, wc)).To(Succeed())
 			}
 
-			eventuallyCondition("wc-overlap-a", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
-			eventuallyCondition("wc-overlap-b", metav1.ConditionFalse, workloadsv1alpha1.ReasonSelectorOverlap)
+			eventuallyOverlap("wc-overlap-a", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap)
+			eventuallyOverlap("wc-overlap-b", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap)
+			eventuallyCondition("wc-overlap-a", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
+			eventuallyCondition("wc-overlap-b", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
 
-			By("deleting wc-overlap-b and verifying the sibling watch clears SelectorOverlap on wc-overlap-a")
+			By("deleting wc-overlap-b and verifying the sibling watch clears PodSelectorOverlap on wc-overlap-a")
 			Expect(k8sClient.Delete(ctx, &workloadsv1alpha1.WorkloadClass{
 				ObjectMeta: metav1.ObjectMeta{Name: "wc-overlap-b", Namespace: namespace},
 			})).To(Succeed())
 
-			eventuallyCondition("wc-overlap-a", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
+			eventuallyOverlap("wc-overlap-a", metav1.ConditionFalse, workloadsv1alpha1.ReasonNoSelectorOverlap)
 		})
 	})
 })
@@ -695,17 +719,15 @@ func TestValidatedCondition(t *testing.T) {
 	invalidSelectorWC.Spec.PodSelector.MatchExpressions = []metav1.LabelSelectorRequirement{
 		{Key: "tier", Operator: metav1.LabelSelectorOpIn},
 	}
-	overlapping := []workloadsv1alpha1.WorkloadClass{*testWorkloadClass("wc-same", "ns", map[string]string{"app": "nginx"})}
 	permissive := testGuardrail("permissive", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 30})
 	restrictive := testGuardrail("restrictive", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 5})
 
 	testCases := []struct {
-		name        string
-		wc          *workloadsv1alpha1.WorkloadClass
-		guardrails  []workloadsv1alpha1.WorkloadClassGuardrail
-		overlapping []workloadsv1alpha1.WorkloadClass
-		wantStatus  metav1.ConditionStatus
-		wantReason  string
+		name       string
+		wc         *workloadsv1alpha1.WorkloadClass
+		guardrails []workloadsv1alpha1.WorkloadClassGuardrail
+		wantStatus metav1.ConditionStatus
+		wantReason string
 	}{
 		{
 			name:       "no_guardrails",
@@ -733,33 +755,10 @@ func TestValidatedCondition(t *testing.T) {
 			wantStatus: metav1.ConditionFalse,
 			wantReason: workloadsv1alpha1.ReasonValidationFailed,
 		},
-		{
-			name:        "selector_overlap_only",
-			wc:          wc,
-			guardrails:  []workloadsv1alpha1.WorkloadClassGuardrail{permissive},
-			overlapping: overlapping,
-			wantStatus:  metav1.ConditionFalse,
-			wantReason:  workloadsv1alpha1.ReasonSelectorOverlap,
-		},
-		{
-			name:        "selector_overlap_without_guardrails",
-			wc:          wc,
-			overlapping: overlapping,
-			wantStatus:  metav1.ConditionFalse,
-			wantReason:  workloadsv1alpha1.ReasonSelectorOverlap,
-		},
-		{
-			name:        "guardrail_violation_takes_precedence_over_overlap",
-			wc:          wc,
-			guardrails:  []workloadsv1alpha1.WorkloadClassGuardrail{restrictive},
-			overlapping: overlapping,
-			wantStatus:  metav1.ConditionFalse,
-			wantReason:  workloadsv1alpha1.ReasonValidationFailed,
-		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := validatedCondition(tc.wc, tc.guardrails, tc.overlapping)
+			got := validatedCondition(tc.wc, tc.guardrails)
 			if got.Type != workloadsv1alpha1.ConditionTypeValidated {
 				t.Errorf("Type = %q, want %q", got.Type, workloadsv1alpha1.ConditionTypeValidated)
 			}
@@ -810,6 +809,45 @@ func TestWorkloadClassMapFuncs(t *testing.T) {
 	})
 }
 
+func TestPodSelectorOverlapCondition(t *testing.T) {
+	wc := testWorkloadClass("wc", "ns", map[string]string{"app": "nginx"})
+	wc.Generation = 4
+	overlapping := []workloadsv1alpha1.WorkloadClass{*testWorkloadClass("wc-same", "ns", map[string]string{"app": "nginx"})}
+
+	testCases := []struct {
+		name        string
+		overlapping []workloadsv1alpha1.WorkloadClass
+		wantStatus  metav1.ConditionStatus
+		wantReason  string
+	}{
+		{
+			name:       "no_overlap",
+			wantStatus: metav1.ConditionFalse,
+			wantReason: workloadsv1alpha1.ReasonNoSelectorOverlap,
+		},
+		{
+			name:        "overlap",
+			overlapping: overlapping,
+			wantStatus:  metav1.ConditionTrue,
+			wantReason:  workloadsv1alpha1.ReasonSelectorOverlap,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := podSelectorOverlapCondition(wc, tc.overlapping)
+			if got.Type != workloadsv1alpha1.ConditionTypePodSelectorOverlap {
+				t.Errorf("Type = %q, want %q", got.Type, workloadsv1alpha1.ConditionTypePodSelectorOverlap)
+			}
+			if got.Status != tc.wantStatus || got.Reason != tc.wantReason {
+				t.Errorf("got (%s, %s), want (%s, %s); message: %q", got.Status, got.Reason, tc.wantStatus, tc.wantReason, got.Message)
+			}
+			if got.ObservedGeneration != wc.Generation {
+				t.Errorf("ObservedGeneration = %d, want %d", got.ObservedGeneration, wc.Generation)
+			}
+		})
+	}
+}
+
 func TestSelectorOverlapMessageCapsItems(t *testing.T) {
 	order := []int{7, 2, 5, 1, 6, 3, 4}
 	overlapping := make([]workloadsv1alpha1.WorkloadClass, 0, len(order))
@@ -818,8 +856,8 @@ func TestSelectorOverlapMessageCapsItems(t *testing.T) {
 	}
 
 	got := selectorOverlapMessage(overlapping)
-	want := "`podSelector` must not select the same Pods as another WorkloadClass in the namespace, " +
-		"but it overlaps with the `podSelector` of 'wc-1', 'wc-2', 'wc-3', 'wc-4', 'wc-5', and 2 more"
+	want := "`podSelector` may select the same Pods as the `podSelector` of 'wc-1', 'wc-2', 'wc-3', 'wc-4', 'wc-5', and 2 more; " +
+		"a Pod selected by more than one WorkloadClass is governed by the oldest of them"
 	if got != want {
 		t.Errorf("selectorOverlapMessage() = %q, want %q", got, want)
 	}

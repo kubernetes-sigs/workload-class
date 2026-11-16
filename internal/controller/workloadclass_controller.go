@@ -42,6 +42,7 @@ import (
 const (
 	validationPassedMsg    = "WorkloadClass adheres to all Guardrail constraints"
 	noGuardrailsMsg        = "No Guardrails found to validate against"
+	noSelectorOverlapMsg   = "`podSelector` does not overlap with the `podSelector` of any other WorkloadClass in the namespace"
 	disjointDaysOfWeekMsg  = "cluster guardrails restrict `daysOfWeek` to disjoint sets, so no disruption window can comply; contact your cluster administrator"
 	maxConditionMessageLen = 32768
 	maxReportedOverlaps    = 5
@@ -60,8 +61,9 @@ type WorkloadClassReconciler struct {
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 //
-// It validates the WorkloadClass against all WorkloadClassGuardrails and against the
-// other WorkloadClasses in its namespace, and surfaces the result as the Validated condition.
+// It validates the WorkloadClass against all WorkloadClassGuardrails and surfaces the result as the
+// Validated condition. It also checks the PodSelector against the other WorkloadClasses in its namespace
+// and surfaces the result as the informational PodSelectorOverlap condition.
 func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -82,12 +84,17 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	cond := validatedCondition(wc, guardrails.Items, overlapping)
-	if !meta.SetStatusCondition(&wc.Status.Conditions, cond) {
+	validated := validatedCondition(wc, guardrails.Items)
+	overlap := podSelectorOverlapCondition(wc, overlapping)
+	validatedChanged := meta.SetStatusCondition(&wc.Status.Conditions, validated)
+	overlapChanged := meta.SetStatusCondition(&wc.Status.Conditions, overlap)
+	if !validatedChanged && !overlapChanged {
 		return ctrl.Result{}, nil
 	}
 
-	log.Info("Updating WorkloadClass Validated condition", "status", cond.Status, "reason", cond.Reason)
+	log.Info("Updating WorkloadClass conditions",
+		"validatedStatus", validated.Status, "validatedReason", validated.Reason,
+		"podSelectorOverlapStatus", overlap.Status, "podSelectorOverlapReason", overlap.Reason)
 	if err := r.Status().Update(ctx, wc); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -97,15 +104,12 @@ func (r *WorkloadClassReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 // validatedCondition builds the Validated condition for the WorkloadClass.
 //
-// Guardrail and spec violations take precedence and are reported with ReasonValidationFailed.
-// If the only problem is that the PodSelector overlaps with other WorkloadClasses in the namespace,
-// ReasonSelectorOverlap is used instead. Overlap is intentionally reported symmetrically on every
-// WorkloadClass involved so that any affected workload owner sees the conflict, while keeping a
-// distinct Reason from ReasonValidationFailed.
+// Guardrail and spec violations are reported with ReasonValidationFailed. PodSelector overlap with other
+// WorkloadClasses is deliberately not part of this condition (see podSelectorOverlapCondition): a Validated=False
+// WorkloadClass does not protect its Pods, so overlap must not be able to turn off protection.
 func validatedCondition(
 	wc *workloadsv1alpha1.WorkloadClass,
 	guardrails []workloadsv1alpha1.WorkloadClassGuardrail,
-	overlapping []workloadsv1alpha1.WorkloadClass,
 ) metav1.Condition {
 	cond := metav1.Condition{
 		Type:               workloadsv1alpha1.ConditionTypeValidated,
@@ -117,25 +121,42 @@ func validatedCondition(
 
 	violations := validateSpec(wc)
 	violations = append(violations, validateAgainstGuardrails(wc, guardrails)...)
-	overlapMsg := selectorOverlapMessage(overlapping)
 
 	switch {
 	case len(violations) > 0:
-		if overlapMsg != "" {
-			violations = append(violations, overlapMsg)
-		}
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = workloadsv1alpha1.ReasonValidationFailed
 		cond.Message = truncateMessage(strings.Join(violations, "; "), maxConditionMessageLen)
-	case overlapMsg != "":
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = workloadsv1alpha1.ReasonSelectorOverlap
-		cond.Message = truncateMessage(overlapMsg, maxConditionMessageLen)
 	case len(guardrails) == 0:
 		cond.Reason = workloadsv1alpha1.ReasonNoGuardrails
 		cond.Message = noGuardrailsMsg
 	}
 
+	return cond
+}
+
+// podSelectorOverlapCondition builds the informational PodSelectorOverlap condition for the WorkloadClass.
+//
+// Overlap is reported symmetrically on every WorkloadClass involved so that any affected workload owner sees
+// it. It does not affect the Validated condition or protection: a Pod selected by more than one WorkloadClass
+// is governed by the oldest of them (by creationTimestamp, then name), and the other WorkloadClasses keep
+// governing the Pods only they select.
+func podSelectorOverlapCondition(
+	wc *workloadsv1alpha1.WorkloadClass,
+	overlapping []workloadsv1alpha1.WorkloadClass,
+) metav1.Condition {
+	cond := metav1.Condition{
+		Type:               workloadsv1alpha1.ConditionTypePodSelectorOverlap,
+		Status:             metav1.ConditionFalse,
+		Reason:             workloadsv1alpha1.ReasonNoSelectorOverlap,
+		Message:            noSelectorOverlapMsg,
+		ObservedGeneration: wc.Generation,
+	}
+	if msg := selectorOverlapMessage(overlapping); msg != "" {
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = workloadsv1alpha1.ReasonSelectorOverlap
+		cond.Message = truncateMessage(msg, maxConditionMessageLen)
+	}
 	return cond
 }
 
@@ -241,7 +262,7 @@ func validateAgainstGuardrails(wc *workloadsv1alpha1.WorkloadClass, guardrails [
 // PodSelector could select the same Pod as the WorkloadClass PodSelector, sorted by name.
 //
 // Overlap is symmetric: every WorkloadClass whose selector overlaps with another active WorkloadClass in
-// the namespace is reported with ReasonSelectorOverlap. WorkloadClasses that are being deleted or have an
+// the namespace reports PodSelectorOverlap=True. WorkloadClasses that are being deleted or have an
 // invalid PodSelector are skipped; an invalid PodSelector is reported on the WorkloadClass that owns it.
 //
 // TODO: Skip selector overlap checks when the Namespace has the workloads.x-k8s.io/enforced-class
@@ -293,8 +314,8 @@ func selectorOverlapMessage(overlapping []workloadsv1alpha1.WorkloadClass) strin
 	if extra := len(names) - limit; extra > 0 {
 		listed = fmt.Sprintf("%s, and %d more", listed, extra)
 	}
-	return fmt.Sprintf("`podSelector` must not select the same Pods as another WorkloadClass in the namespace, "+
-		"but it overlaps with the `podSelector` of %s", listed)
+	return fmt.Sprintf("`podSelector` may select the same Pods as the `podSelector` of %s; "+
+		"a Pod selected by more than one WorkloadClass is governed by the oldest of them", listed)
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -311,7 +332,7 @@ func (r *WorkloadClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		// Re-validate the other WorkloadClasses in a namespace when a WorkloadClass is created, deleted, or its spec
-		// changes, so that their SelectorOverlap status stays current.
+		// changes, so that their PodSelectorOverlap condition stays current.
 		Watches(
 			&workloadsv1alpha1.WorkloadClass{},
 			handler.EnqueueRequestsFromMapFunc(r.workloadClassesInNamespace),
