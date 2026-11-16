@@ -23,7 +23,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -35,9 +34,8 @@ const conditionTypeMaintenanceAllowed = "MaintenanceAllowed"
 
 // DisruptionWebhook handles Pod eviction requests.
 type DisruptionWebhook struct {
-	Client   client.Client
-	decoder  *admission.Decoder
-	Recorder events.EventRecorder
+	Client  client.Client
+	decoder *admission.Decoder
 }
 
 // Handle handles admission requests for Pod evictions.
@@ -56,7 +54,7 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	// 3. Find matching WorkloadClass
-	bestWC, err := v.bestMatchWorkloadClass(ctx, req, pod)
+	bestWC, err := v.bestMatchWorkloadClass(ctx, pod)
 	if err != nil {
 		log.Error(err, "failed to get WorkloadClass for Pod", "pod", pod)
 		return admission.Allowed("Failed to get WorkloadClass matches this pod or namespace")
