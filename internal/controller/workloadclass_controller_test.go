@@ -1196,6 +1196,102 @@ var _ = Describe("WorkloadClass Controller", func() {
 			setNamespaceEnforcedClass(ns, "wc-missing")
 			eventuallyPDBs("0", map[string]string{})
 		})
+
+		It("should keep protecting the Pods of a WorkloadClass when an overlapping WorkloadClass is created", func() {
+			const ns = "wc-overlap-pdbs"
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			DeferCleanup(func() {
+				Expect(k8sClient.DeleteAllOf(ctx, &workloadsv1alpha1.WorkloadClass{}, client.InNamespace(ns))).To(Succeed())
+				deleteAllPods(ns)
+				Expect(k8sClient.DeleteAllOf(ctx, &policyv1.PodDisruptionBudget{}, client.InNamespace(ns))).To(Succeed())
+			})
+			Expect(k8sClient.Create(ctx, &workloadsv1alpha1.WorkloadClassGuardrail{
+				ObjectMeta: metav1.ObjectMeta{Name: guardrailName},
+				Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{Constraints: workloadsv1alpha1.Constraints{
+					Disruption: workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 10},
+				}},
+			})).To(Succeed())
+			// The window is never open during the test, so both WorkloadClasses are NotReady and their PDBs closed.
+			now := time.Now().UTC()
+			newWC := func(name string, matchLabels map[string]string) *workloadsv1alpha1.WorkloadClass {
+				return &workloadsv1alpha1.WorkloadClass{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+					Spec: workloadsv1alpha1.WorkloadClassSpec{
+						PodSelector: &metav1.LabelSelector{MatchLabels: matchLabels},
+						DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{
+							MaxNonDisruptionDurationDays: 7,
+							AllowedDisruptionWindows: []workloadsv1alpha1.DisruptionWindow{{
+								Name:      "later",
+								TimeZone:  "UTC",
+								StartTime: now.Add(2 * time.Hour).Format("15:04"),
+								EndTime:   now.Add(3 * time.Hour).Format("15:04"),
+							}},
+						},
+					},
+				}
+			}
+			// eventuallyPDBs waits until the managed PDBs in the namespace are exactly those of the Pods in owners, each
+			// controlled by the given WorkloadClass and closed, and returns their UIDs by Pod name.
+			eventuallyPDBs := func(owners map[string]string) map[string]types.UID {
+				GinkgoHelper()
+				uids := map[string]types.UID{}
+				Eventually(func(g Gomega) {
+					pdbs := &policyv1.PodDisruptionBudgetList{}
+					g.Expect(k8sClient.List(ctx, pdbs, client.InNamespace(ns))).To(Succeed())
+					got := map[string]string{}
+					clear(uids)
+					for _, pdb := range pdbs.Items {
+						podName := utils.PodNameFromPDBName(pdb.Name)
+						got[podName], uids[podName] = metav1.GetControllerOf(&pdb).Name, pdb.UID
+						g.Expect(pdb.Spec.MaxUnavailable.String()).To(Equal("0"), "PDB %s", pdb.Name)
+					}
+					g.Expect(got).To(Equal(owners))
+				}).Should(Succeed())
+				return uids
+			}
+			expectStatus := func(name string, overlap metav1.ConditionStatus) {
+				GinkgoHelper()
+				Eventually(func(g Gomega) {
+					wc := &workloadsv1alpha1.WorkloadClass{}
+					g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, wc)).To(Succeed())
+					g.Expect(meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypeValidated)).
+						To(HaveField("Reason", workloadsv1alpha1.ReasonValidationPassed))
+					g.Expect(meta.FindStatusCondition(wc.Status.Conditions, workloadsv1alpha1.ConditionTypePodSelectorOverlap)).
+						To(HaveField("Status", overlap))
+					g.Expect(wc.Status.MaintenanceReadiness).To(Equal(workloadsv1alpha1.ReadinessNotReady))
+				}).Should(Succeed())
+			}
+
+			web := map[string]string{"app": "shop", "tier": "web"}
+			for name, podLabels := range map[string]map[string]string{"web-1": web, "api-1": {"app": "shop"}} {
+				Expect(k8sClient.Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: podLabels},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},
+				})).To(Succeed())
+			}
+
+			By("protecting web-1 with wc-web")
+			Expect(k8sClient.Create(ctx, newWC("wc-web", web))).To(Succeed())
+			expectStatus("wc-web", metav1.ConditionFalse)
+			before := eventuallyPDBs(map[string]string{"web-1": "wc-web"})
+
+			By("creating the overlapping wc-broad, which reports the overlap but leaves web-1 to the older wc-web")
+			// creationTimestamp has a resolution of one second, and wc-broad would win a tie by name.
+			time.Sleep(1100 * time.Millisecond)
+			Expect(k8sClient.Create(ctx, newWC("wc-broad", map[string]string{"app": "shop"}))).To(Succeed())
+			expectStatus("wc-broad", metav1.ConditionTrue)
+			expectStatus("wc-web", metav1.ConditionTrue)
+			during := eventuallyPDBs(map[string]string{"web-1": "wc-web", "api-1": "wc-broad"})
+			Expect(during["web-1"]).To(Equal(before["web-1"]))
+
+			By("handing the PDB of web-1 over to wc-broad when wc-web is deleted")
+			Expect(k8sClient.Delete(ctx, &workloadsv1alpha1.WorkloadClass{
+				ObjectMeta: metav1.ObjectMeta{Name: "wc-web", Namespace: ns},
+			})).To(Succeed())
+			after := eventuallyPDBs(map[string]string{"web-1": "wc-broad", "api-1": "wc-broad"})
+			Expect(after).To(Equal(during))
+			expectStatus("wc-broad", metav1.ConditionFalse)
+		})
 	})
 })
 
