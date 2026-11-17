@@ -78,7 +78,7 @@ type DisruptionWindow struct {
 	// +optional
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^([A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}|UTC|GMT)$`
-	// +kubebuilder:validation:XValidation:rule="self != 'Local' && self != 'local'",message="timeZone cannot be Local"
+	// +kubebuilder:validation:XValidation:rule="self != 'Local' && self != 'local'",message="must not be 'Local' or 'local'"
 	TimeZone string `json:"timeZone,omitempty"`
 
 	// StartTime is the start time of the window in HH:MM format (e.g. 22:00) in the specified timeZone (or UTC if timeZone is omitted).
@@ -152,8 +152,18 @@ const (
 	ReasonValidationFailed = "ValidationFailed"
 	// ReasonNoGuardrails indicates that no Guardrails were found to validate against.
 	ReasonNoGuardrails = "NoGuardrails"
+
+	// ConditionTypePodSelectorOverlap reports whether the WorkloadClass PodSelector may select the same Pods as
+	// another WorkloadClass in the same namespace. It is informational: it does not affect the Validated condition
+	// or whether the WorkloadClass protects Pods. A Pod selected by more than one WorkloadClass is governed by the
+	// oldest of them (by creationTimestamp, then name).
+	ConditionTypePodSelectorOverlap = "PodSelectorOverlap"
+
 	// ReasonSelectorOverlap indicates that the WorkloadClass PodSelector overlaps with another WorkloadClass in the same namespace.
 	ReasonSelectorOverlap = "SelectorOverlap"
+	// ReasonNoSelectorOverlap indicates that the WorkloadClass PodSelector does not overlap with any other WorkloadClass
+	// in the same namespace.
+	ReasonNoSelectorOverlap = "NoSelectorOverlap"
 )
 
 // WorkloadClassStatus defines the observed state of WorkloadClass.
