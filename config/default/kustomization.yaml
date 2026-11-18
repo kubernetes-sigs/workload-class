@@ -54,6 +54,9 @@ patches:
   target:
     kind: Deployment
 
+# Scope the pods/eviction DisruptionWebhook to every namespace except kube-system and the controller's namespace.
+- path: disruption_webhook_patch.yaml
+
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER' prefix.
 # Uncomment the following replacements to add the cert-manager CA injection annotations
 replacements:
@@ -153,6 +156,11 @@ replacements:
          delimiter: '.'
          index: 1
          create: true
+     # Exclude the controller's own namespace from the pods/eviction DisruptionWebhook (disruption_webhook_patch.yaml).
+     - select:
+         kind: ValidatingWebhookConfiguration
+       fieldPaths:
+         - webhooks.[name=vpoddisruption.workloads.x-k8s.io].namespaceSelector.matchExpressions.0.values.1
 
  - source: # Uncomment the following block if you have a ValidatingWebhook (--programmatic-validation)
      kind: Certificate

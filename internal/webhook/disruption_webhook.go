@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -32,10 +33,39 @@ import (
 
 const conditionTypeMaintenanceAllowed = "MaintenanceAllowed"
 
+// DisruptionWebhookPath is the path the DisruptionWebhook is served on. It must match the path in the
+// +kubebuilder:webhook marker below.
+const DisruptionWebhookPath = "/validate-disruption"
+
+// The webhook only receives pods/eviction requests, so a Pod delete that does not go through the Eviction API is
+// never intercepted.
+//
+// failurePolicy is Ignore: if the webhook cannot be reached (e.g. the controller is down or being rolled out), the
+// API server admits the eviction instead of rejecting every eviction in the cluster, which would block node drains,
+// node upgrades, and cluster autoscaler scale-down. The Per-Pod PodDisruptionBudgets managed by the WorkloadClass
+// controller keep enforcing the disruption policy while the webhook is unavailable.
+//
+// The namespaceSelector that excludes kube-system and the controller's own namespace (so that draining the node of
+// the controller Pod cannot deadlock on the webhook) is added in config/default, since the marker cannot express it.
+//
+// +kubebuilder:webhook:path=/validate-disruption,mutating=false,failurePolicy=ignore,sideEffects=None,timeoutSeconds=5,groups="",resources=pods/eviction,verbs=create,versions=v1,name=vpoddisruption.workloads.x-k8s.io,admissionReviewVersions=v1
+
+// The webhook reads the evicted Pod, its Namespace, and the WorkloadClasses in the Namespace from the manager's cache.
+//
+// +kubebuilder:rbac:groups="",resources=pods;namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses,verbs=get;list;watch
+
 // DisruptionWebhook handles Pod eviction requests.
 type DisruptionWebhook struct {
-	Client  client.Client
-	decoder *admission.Decoder
+	Client client.Client
+}
+
+// SetupDisruptionWebhookWithManager registers the DisruptionWebhook with the manager's webhook server.
+func SetupDisruptionWebhookWithManager(mgr ctrl.Manager) error {
+	mgr.GetWebhookServer().Register(DisruptionWebhookPath, &admission.Webhook{
+		Handler: &DisruptionWebhook{Client: mgr.GetClient()},
+	})
+	return nil
 }
 
 // Handle handles admission requests for Pod evictions.
@@ -100,10 +130,4 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		}
 		return admission.Denied(fmt.Sprintf("Eviction blocked: WorkloadClass %s is not ready for maintenance", bestWC.Name))
 	}
-}
-
-// InjectDecoder injects the decoder.
-func (v *DisruptionWebhook) InjectDecoder(d *admission.Decoder) error {
-	v.decoder = d
-	return nil
 }

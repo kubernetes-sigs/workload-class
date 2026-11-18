@@ -37,6 +37,7 @@ import (
 
 	workloadsv1alpha1 "sigs.k8s.io/workload-class/api/v1alpha1"
 	"sigs.k8s.io/workload-class/internal/controller"
+	internalwebhook "sigs.k8s.io/workload-class/internal/webhook"
 	webhookv1alpha1 "sigs.k8s.io/workload-class/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
@@ -190,6 +191,10 @@ func main() {
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
 		if err := webhookv1alpha1.SetupWorkloadClassGuardrailWebhookWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create webhook", "webhook", "WorkloadClassGuardrail")
+			os.Exit(1)
+		}
+		if err := internalwebhook.SetupDisruptionWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "Disruption")
 			os.Exit(1)
 		}
 	}
