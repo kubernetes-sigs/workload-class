@@ -148,6 +148,9 @@ var _ = Describe("Per-Pod PodDisruptionBudgets", Ordered, ContinueOnFailure, fun
 	})
 
 	It("opens the PDBs inside the disruption window and closes them outside of it", func() {
+		// Restore the closed window if the spec fails midway, so that later specs still start from closed PDBs.
+		DeferCleanup(func() { mustApply(newPPWorkloadClass(ppWC, map[string]string{"app": "web"}, false)) })
+
 		By("moving the disruption window to cover now")
 		mustApply(newPPWorkloadClass(ppWC, map[string]string{"app": "web"}, true))
 		expectPerPodPDBs(ppWebPods, ppWC, ppOpen, ppReplicas)
@@ -158,6 +161,8 @@ var _ = Describe("Per-Pod PodDisruptionBudgets", Ordered, ContinueOnFailure, fun
 	})
 
 	It("replaces the PDB of a deleted Pod and follows the Deployment as it scales", func() {
+		// Restore the replica count if the spec fails midway, so that later specs still start from ppReplicas Pods.
+		DeferCleanup(func() { applyPPDeployment("web", ppReplicas) })
 		deleted := podNames(expectPerPodPDBs(ppWebPods, ppWC, ppClosed, ppReplicas))[0]
 
 		By("deleting a Pod")
