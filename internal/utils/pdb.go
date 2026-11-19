@@ -64,8 +64,10 @@ func PDBName(podName string) string {
 // PodNameFromPDBName returns the name of the Pod that a PodDisruptionBudget managed by a WorkloadClass was created
 // for, by removing the `workload-` prefix.
 //
-// The result is not the Pod name if PDBName truncated the name; callers can detect that case by the PDB name being
-// MaxPDBNameLength characters long and compare PDBName(pod.Name) against the PDB name instead.
+// The result is not the Pod name if PDBName truncated the name. A truncated name is not necessarily
+// MaxPDBNameLength characters long, because separators left at the truncation point are trimmed before the hash
+// suffix is appended, so callers should not detect truncation by length. Instead, they can compare PDBName(pod.Name)
+// against the PDB name, or look the Pod up by the PodUIDLabel label of the PDB.
 func PodNameFromPDBName(pdbName string) string {
 	return strings.TrimPrefix(pdbName, PDBNamePrefix)
 }
@@ -138,6 +140,10 @@ func SyncPDBWithWorkloadClass(
 
 	open := intstr.FromString(openValue)
 	closed := intstr.FromInt32(closedValue)
+
+	// MinAvailable and MaxUnavailable are mutually exclusive. Clear MinAvailable in case it was set by an external
+	// edit of the PDB, so that the update restores the PDB instead of being rejected.
+	pdb.Spec.MinAvailable = nil
 
 	if !protects {
 		pdb.Spec.MaxUnavailable = &open
