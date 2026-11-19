@@ -372,6 +372,69 @@ var _ = Describe("WorkloadClass validation", Ordered, ContinueOnFailure, func() 
 			eventuallyOverlap("jobs-copy", metav1.ConditionTrue, workloadsv1alpha1.ReasonSelectorOverlap)
 		})
 	})
+
+	Context("admission", func() {
+		It("rejects a WorkloadClass whose timeZone is Local", func() {
+			local := window("local", "Saturday")
+			local.TimeZone = "Local"
+			out, err := apply(newWorkloadClass("local-zone", map[string]string{"app": "local-zone"},
+				withWindows(local), withMaxNonDisruptionDays(7)))
+			Expect(err).To(HaveOccurred())
+			Expect(out).To(ContainSubstring("must not be 'Local' or 'local'"))
+		})
+
+		It("rejects a WorkloadClassGuardrail with invalid daysOfWeek", func() {
+			out, err := apply(newGuardrail("wc-e2e-invalid-days", workloadsv1alpha1.Disruption{
+				DaysOfWeek:                   []string{"Saturday", "Caturday"},
+				MaxNonDisruptionDurationDays: 7,
+			}))
+			Expect(err).To(HaveOccurred())
+			Expect(out).To(SatisfyAll(
+				ContainSubstring("`daysOfWeek` must only contain"),
+				ContainSubstring("got 'Caturday'"),
+			))
+		})
+
+		It("admits a WorkloadClassGuardrail but warns about existing WorkloadClasses that do not comply", func() {
+			mustApply(newWorkloadClass("lax", map[string]string{"app": "lax"}, withMaxNonDisruptionDays(30)))
+			mustApply(newWorkloadClass("tight", map[string]string{"app": "tight"}, withMaxNonDisruptionDays(5)))
+			// Wait for the manager's informer cache (shared with the webhook) to observe both WorkloadClasses.
+			eventuallyValidated("lax", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
+			eventuallyValidated("tight", metav1.ConditionTrue, workloadsv1alpha1.ReasonNoGuardrails)
+
+			out, err := apply(newGuardrail("wc-e2e-warns", workloadsv1alpha1.Disruption{MaxNonDisruptionDurationDays: 10}))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(SatisfyAll(
+				ContainSubstring(fmt.Sprintf(
+					"Warning: existing WorkloadClass '%s/lax' does not comply with this guardrail", testNamespace)),
+				ContainSubstring("must be between 1 and 10, inclusive (guardrail limit), got 30"),
+				Not(ContainSubstring(fmt.Sprintf("'%s/tight'", testNamespace))),
+			))
+
+			By("marking the non-compliant WorkloadClass as ValidationFailed")
+			eventuallyValidated("lax", metav1.ConditionFalse, workloadsv1alpha1.ReasonValidationFailed)
+			eventuallyValidated("tight", metav1.ConditionTrue, workloadsv1alpha1.ReasonValidationPassed)
+		})
+	})
+
+	Context("controller manager", func() {
+		It("runs without restarts or RBAC errors", func() {
+			podName := controllerPodName()
+			Expect(podName).NotTo(BeEmpty())
+
+			restarts, err := utils.Run(exec.Command("kubectl", "get", "pod", podName, "-n", namespace,
+				"-o", "jsonpath={.status.containerStatuses[*].restartCount}"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.Fields(restarts)).To(HaveEach("0"))
+
+			logs, err := utils.Run(exec.Command("kubectl", "logs", podName, "-n", namespace))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.ToLower(logs)).NotTo(SatisfyAny(
+				ContainSubstring("forbidden"),
+				ContainSubstring("cannot list resource"),
+			))
+		})
+	})
 })
 
 // wcOption customizes a WorkloadClass built by newWorkloadClass.
