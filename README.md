@@ -14,7 +14,7 @@ A high-level Kubernetes control layer for managing workload outcomes and disrupt
 A `WorkloadClass` is resolved for a Pod using the following order of precedence:
 
 1. **Namespace-enforced class (`workloads.x-k8s.io/enforced-class`)**: If a `Namespace` carries the `workloads.x-k8s.io/enforced-class: <workload-class-name>` label (`EnforcedWorkloadClassLabel`), that `WorkloadClass` is enforced across all Pods in the namespace, overriding its own `spec.podSelector` as well as any other `WorkloadClass` in that namespace.
-2. **Pod label selector (`spec.podSelector`)**: If no namespace-enforced class is set, Pods are matched by `spec.podSelector` in the same namespace. `WorkloadClass` selectors within a namespace should be non-overlapping; overlapping `podSelector`s are surfaced via a status `Condition` on the `WorkloadClass`.
+2. **Pod label selector (`spec.podSelector`)**: If no namespace-enforced class is set, Pods are matched by `spec.podSelector` in the same namespace. `WorkloadClass` selectors within a namespace should be non-overlapping. Overlapping `podSelector`s are reported through the informational `PodSelectorOverlap` condition on every `WorkloadClass` involved; they don't fail validation or turn off protection. A Pod selected by more than one `WorkloadClass` is governed by the oldest of them (by `creationTimestamp`, then name).
 
 ### Relationship to Upstream `scheduling.k8s.io` `Workload`
 
