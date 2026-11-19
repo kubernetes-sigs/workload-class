@@ -53,6 +53,8 @@ func TestControllers(t *testing.T) {
 
 var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
+	// Specs that run the controller manager wait for watch events to propagate through informers and reconciles.
+	SetDefaultEventuallyTimeout(10 * time.Second)
 
 	ctx, cancel = context.WithCancel(context.TODO())
 
