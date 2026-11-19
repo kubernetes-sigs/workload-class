@@ -47,7 +47,7 @@ import (
 // If no matching or active enforced WorkloadClass is found, it returns nil.
 func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, pod *corev1.Pod) (*workloadsv1alpha1.WorkloadClass, error) {
 	// If the namespace defines an enforced WorkloadClass, it overrides PodSelector matching for the namespace.
-	if bestMatch, enforced := v.namespaceDefaultWorkloadClass(ctx, pod); enforced {
+	if bestMatch, enforced := v.namespaceEnforcedWorkloadClass(ctx, pod); enforced {
 		return bestMatch, nil
 	}
 
@@ -59,12 +59,12 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, pod *cor
 	return utils.SelectorBestMatch(pod, wcs.Items), nil
 }
 
-// namespaceDefaultWorkloadClass returns the WorkloadClass enforced by the Pod's Namespace (see
+// namespaceEnforcedWorkloadClass returns the WorkloadClass enforced by the Pod's Namespace (see
 // utils.NamespaceEnforcedWorkloadClass) and whether the Namespace enforces one.
 //
 // Errors are logged rather than returned: if the Namespace cannot be read, PodSelector matching is used; if the
 // enforced WorkloadClass cannot be read, no WorkloadClass applies to the Pod.
-func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod) (*workloadsv1alpha1.WorkloadClass, bool) {
+func (v *DisruptionWebhook) namespaceEnforcedWorkloadClass(ctx context.Context, pod *corev1.Pod) (*workloadsv1alpha1.WorkloadClass, bool) {
 	wc, enforced, err := utils.NamespaceEnforcedWorkloadClass(ctx, v.Client, pod.Namespace)
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "Failed to get namespace enforced WorkloadClass", "namespace", pod.Namespace)
