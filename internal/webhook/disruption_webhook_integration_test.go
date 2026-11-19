@@ -46,10 +46,20 @@ const (
 var _ = Describe("DisruptionWebhook", func() {
 	var namespace string
 
+	waitForCached := func(obj client.Object) {
+		GinkgoHelper()
+		Eventually(func(g Gomega) {
+			got := obj.DeepCopyObject().(client.Object)
+			g.Expect(mgrCache.Get(ctx, client.ObjectKeyFromObject(obj), got)).To(Succeed())
+			g.Expect(got.GetResourceVersion()).To(Equal(obj.GetResourceVersion()))
+		}).Should(Succeed())
+	}
+
 	newNamespace := func(labels map[string]string) string {
 		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "disruption-", Labels: labels}}
 		Expect(k8sClient.Create(ctx, ns)).To(Succeed())
 		DeferCleanup(func() { Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, ns))).To(Succeed()) })
+		waitForCached(ns)
 		return ns.Name
 	}
 
@@ -91,6 +101,7 @@ var _ = Describe("DisruptionWebhook", func() {
 		}
 		wc.Status.MaintenanceReadiness = readiness
 		Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+		waitForCached(wc)
 		return wc
 	}
 

@@ -62,6 +62,18 @@ type DisruptionWebhook struct {
 
 // SetupDisruptionWebhookWithManager registers the DisruptionWebhook with the manager's webhook server.
 func SetupDisruptionWebhookWithManager(mgr ctrl.Manager) error {
+	// Pre-register informers so the cache syncs at manager startup rather than lazily inside the 5s timeout of the
+	// first pods/eviction request (no controller watches Namespaces).
+	for _, obj := range []client.Object{
+		&corev1.Pod{},
+		&corev1.Namespace{},
+		&workloadsv1alpha1.WorkloadClass{},
+	} {
+		if _, err := mgr.GetCache().GetInformer(context.Background(), obj); err != nil {
+			return err
+		}
+	}
+
 	mgr.GetWebhookServer().Register(DisruptionWebhookPath, &admission.Webhook{
 		Handler: &DisruptionWebhook{Client: mgr.GetClient()},
 	})

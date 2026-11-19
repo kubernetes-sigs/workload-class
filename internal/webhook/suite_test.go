@@ -48,6 +48,7 @@ var (
 	ctx       context.Context
 	cancel    context.CancelFunc
 	k8sClient client.Client
+	mgrCache  client.Reader
 	cfg       *rest.Config
 	testEnv   *envtest.Environment
 )
@@ -99,6 +100,8 @@ var _ = BeforeSuite(func() {
 		Metrics:        metricsserver.Options{BindAddress: "0"},
 	})
 	Expect(err).NotTo(HaveOccurred())
+
+	mgrCache = mgr.GetCache()
 
 	Expect(SetupDisruptionWebhookWithManager(mgr)).To(Succeed())
 
