@@ -2352,8 +2352,13 @@ func TestGovernedPods(t *testing.T) {
 	wcNginx.CreationTimestamp = metav1.NewTime(time.Now())
 	wcNil := testWorkloadClass("wc-nil", "ns", nil)
 	wcNil.Spec.PodSelector = nil
+	// wcDeleting is the oldest class that selects the nginx Pods, but it is being deleted, so it governs none of them.
+	wcDeleting := testWorkloadClass("wc-deleting", "ns", nginx)
+	wcDeleting.CreationTimestamp = metav1.NewTime(time.Now().Add(-2 * time.Hour))
+	wcDeleting.Finalizers = []string{"workloads.x-k8s.io/test"}
+	wcDeleting.DeletionTimestamp = ptr.To(metav1.Now())
 	objects := []client.Object{
-		wcNginx, wcNginxWeb, wcNil,
+		wcNginx, wcNginxWeb, wcNil, wcDeleting,
 		testPod("pod-nginx", nginx, time.Now()),
 		testPod("pod-nginx-web", nginxWeb, time.Now()),
 		testPod("pod-redis", map[string]string{"app": "redis"}, time.Now()),
@@ -2394,6 +2399,15 @@ func TestGovernedPods(t *testing.T) {
 			name: "enforced_label_naming_a_missing_class_governs_nothing",
 			wc:   wcNginx,
 			ns:   testEnforcingNamespace("ns", "wc-missing"),
+		},
+		{
+			name: "deleting_class_governs_nothing",
+			wc:   wcDeleting,
+		},
+		{
+			name: "enforced_label_naming_a_deleting_class_governs_nothing",
+			wc:   wcDeleting,
+			ns:   testEnforcingNamespace("ns", "wc-deleting"),
 		},
 	}
 	for _, tc := range testCases {
