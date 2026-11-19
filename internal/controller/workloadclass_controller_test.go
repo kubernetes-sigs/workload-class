@@ -1698,11 +1698,11 @@ func TestCalculateReadiness(t *testing.T) {
 			wc: newWC(func(p *workloadsv1alpha1.DisruptionPolicy) {
 				p.MinInitialRunDurationDays = 1
 			}),
-			validated:           validated,
-			pods:                []client.Object{terminatingTestPod("young-terminating", selected, now, now)},
-			wantReadiness:       workloadsv1alpha1.ReadinessReady,
-			wantReason:          workloadsv1alpha1.ReasonWithinDisruptionWindow,
-			wantLastTermination: ptr.To(now),
+			validated:     validated,
+			pods:          []client.Object{terminatingTestPod("young-terminating", selected, now, now)},
+			wantReadiness: workloadsv1alpha1.ReadinessReady,
+			wantReason:    workloadsv1alpha1.ReasonWithinDisruptionWindow,
+			// Without GraceTerminationDurationSeconds, terminations are not recorded.
 		},
 		{
 			name: "young_and_terminating_pods_report_min_initial_run_until_it_passes",
@@ -1816,6 +1816,30 @@ func TestReadinessMessages(t *testing.T) {
 				t.Errorf("calculateReadiness() message = %q, want %q", got.message, tc.want)
 			}
 		})
+	}
+}
+
+func TestPodsBlockingMaintenanceMessageIsOrderIndependent(t *testing.T) {
+	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
+	wc := testWorkloadClass("wc", "ns", nil)
+	wc.Spec.DisruptionPolicy.MinInitialRunDurationDays = 1
+	selected := map[string]string{"app": "nginx"}
+	// 'b' and 'c' run long enough last, at the same time; 'a' runs long enough first.
+	a := *testPod("a", selected, now.Add(-22*time.Hour))
+	b := *testPod("b", selected, now.Add(-20*time.Hour))
+	c := *testPod("c", selected, now.Add(-20*time.Hour))
+	const want = "3 selected Pods (e.g. 'b') have not yet run for `minInitialRunDurationDays`; the last one will at " +
+		"2026-04-20T16:00:00Z"
+
+	for _, pods := range [][]corev1.Pod{{a, b, c}, {c, b, a}, {b, a, c}, {c, a, b}} {
+		got, until := podsBlockingMaintenance(wc, pods, now)
+		if got == nil {
+			t.Fatalf("podsBlockingMaintenance(%s, %s, %s) = nil, want NotReady", pods[0].Name, pods[1].Name, pods[2].Name)
+		}
+		if got.message != want || until != 4*time.Hour {
+			t.Errorf("podsBlockingMaintenance(%s, %s, %s) = (%q, %v), want (%q, %v)",
+				pods[0].Name, pods[1].Name, pods[2].Name, got.message, until, want, 4*time.Hour)
+		}
 	}
 }
 
@@ -2007,6 +2031,15 @@ func TestLastDisruptionTimeChangedPredicate(t *testing.T) {
 	t.Run("same_time_in_different_pointers", func(t *testing.T) {
 		oldWC := withChange(func(wc *workloadsv1alpha1.WorkloadClass) { wc.Status.LastDisruptionTime = ptr.To(now) })
 		newWC := withChange(func(wc *workloadsv1alpha1.WorkloadClass) { wc.Status.LastDisruptionTime = ptr.To(now) })
+		if p.Update(event.UpdateEvent{ObjectOld: oldWC, ObjectNew: newWC}) {
+			t.Error("Update() = true, want false")
+		}
+	})
+	t.Run("same_instant_in_different_locations", func(t *testing.T) {
+		oldWC := withChange(func(wc *workloadsv1alpha1.WorkloadClass) { wc.Status.LastDisruptionTime = ptr.To(now) })
+		newWC := withChange(func(wc *workloadsv1alpha1.WorkloadClass) {
+			wc.Status.LastDisruptionTime = ptr.To(metav1.NewTime(now.In(time.FixedZone("UTC+2", 2*60*60))))
+		})
 		if p.Update(event.UpdateEvent{ObjectOld: oldWC, ObjectNew: newWC}) {
 			t.Error("Update() = true, want false")
 		}

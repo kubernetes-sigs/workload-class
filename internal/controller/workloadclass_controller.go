@@ -404,8 +404,9 @@ func (r readinessResult) condition(generation int64) metav1.Condition {
 // WorkloadClass is requeued at the earliest of: the next disruption window start or end, the time it becomes overdue,
 // and the time the selected Pods stop blocking maintenance.
 //
-// As a side effect, Status.LastPodTerminationTime is advanced to the most recent time a selected Pod was observed to
-// start terminating, so that GraceTerminationDurationSeconds is honored after the Pod is gone.
+// If GraceTerminationDurationSeconds is set, as a side effect, Status.LastPodTerminationTime is advanced to the most
+// recent time a selected Pod was observed to start terminating, so that the grace period is honored after the Pod is
+// gone.
 func (r *WorkloadClassReconciler) calculateReadiness(
 	ctx context.Context, wc *workloadsv1alpha1.WorkloadClass, validated metav1.Condition,
 ) (readinessResult, error) {
@@ -427,7 +428,11 @@ func (r *WorkloadClassReconciler) calculateReadiness(
 		if pods, err = r.selectedPods(ctx, wc); err != nil {
 			return readinessResult{}, err
 		}
-		recordPodTerminations(wc, pods)
+		// Status.LastPodTerminationTime is only read for GraceTerminationDurationSeconds, so it is not recorded
+		// (and patched) otherwise.
+		if policy.GraceTerminationDurationSeconds > 0 {
+			recordPodTerminations(wc, pods)
+		}
 	}
 
 	if policy.EmergencyOverride {
@@ -536,24 +541,32 @@ func podsBlockingMaintenance(
 	wc *workloadsv1alpha1.WorkloadClass, pods []corev1.Pod, now time.Time,
 ) (*readinessResult, time.Duration) {
 	if wc.Spec.DisruptionPolicy.MinInitialRunDurationDays > 0 {
-		var young []*corev1.Pod
+		// The Pod named in the message is the one that runs long enough last, ties broken by the smallest name, so
+		// that the message does not depend on the order of the Pods listed from the cache. A message that changes
+		// between reconciles would patch the status every time.
+		young := 0
+		var lastPod string
 		var untilRun time.Duration
 		for i := range pods {
 			pod := &pods[i]
 			if pod.DeletionTimestamp != nil || isPodTerminal(pod) {
 				continue
 			}
-			if passed, remaining := minInitialRunPassed(wc, pod, now); !passed {
-				young = append(young, pod)
-				untilRun = max(untilRun, remaining)
+			passed, remaining := minInitialRunPassed(wc, pod, now)
+			if passed {
+				continue
+			}
+			young++
+			if young == 1 || remaining > untilRun || (remaining == untilRun && pod.Name < lastPod) {
+				lastPod, untilRun = pod.Name, remaining
 			}
 		}
-		if len(young) > 0 {
+		if young > 0 {
 			return &readinessResult{
 				readiness: workloadsv1alpha1.ReadinessNotReady,
 				reason:    workloadsv1alpha1.ReasonMinInitialRunDurationNotMet,
 				message: fmt.Sprintf("%d selected %s (e.g. '%s') %s not yet run for `minInitialRunDurationDays`; the last one will at %s",
-					len(young), pluralize(len(young), "Pod", "Pods"), young[0].Name, pluralize(len(young), "has", "have"),
+					young, pluralize(young, "Pod", "Pods"), lastPod, pluralize(young, "has", "have"),
 					now.Add(untilRun).Format(time.RFC3339)),
 			}, untilRun
 		}
@@ -730,7 +743,7 @@ func lastDisruptionTimeChangedPredicate() predicate.Funcs {
 			if !okOld || !okNew {
 				return false
 			}
-			return !ptr.Equal(oldWC.Status.LastDisruptionTime, newWC.Status.LastDisruptionTime)
+			return !oldWC.Status.LastDisruptionTime.Equal(newWC.Status.LastDisruptionTime)
 		},
 	}
 }
