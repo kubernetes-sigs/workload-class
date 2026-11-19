@@ -37,7 +37,7 @@ const (
 	testLabelValB = "valueB"
 )
 
-func TestNamespaceDefaultWorkloadClass(t *testing.T) {
+func TestNamespaceEnforcedWorkloadClass(t *testing.T) {
 	now := metav1.Now()
 	wc := &workloadsv1alpha1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: testNamespace},
@@ -75,15 +75,15 @@ func TestNamespaceDefaultWorkloadClass(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			v := &DisruptionWebhook{Client: createClient(tc.getNSError, tc.getWCError, nil, nil, tc.getNSResult, tc.getWCResult, nil, nil)}
-			gotWC, gotEnforced := v.namespaceDefaultWorkloadClass(ctx, pod)
+			gotWC, gotEnforced := v.namespaceEnforcedWorkloadClass(ctx, pod)
 			if gotEnforced != tc.wantEnforced {
-				t.Errorf("namespaceDefaultWorkloadClass() enforced = %v, want %v", gotEnforced, tc.wantEnforced)
+				t.Errorf("namespaceEnforcedWorkloadClass() enforced = %v, want %v", gotEnforced, tc.wantEnforced)
 			}
 			if (gotWC != nil) != (tc.wantBestMatch != nil) {
-				t.Fatalf("namespaceDefaultWorkloadClass() = %v, want %v", gotWC, tc.wantBestMatch)
+				t.Fatalf("namespaceEnforcedWorkloadClass() = %v, want %v", gotWC, tc.wantBestMatch)
 			}
 			if gotWC != nil && gotWC.Name != tc.wantBestMatch.Name {
-				t.Errorf("namespaceDefaultWorkloadClass() = %v, want %v", gotWC, tc.wantBestMatch)
+				t.Errorf("namespaceEnforcedWorkloadClass() = %v, want %v", gotWC, tc.wantBestMatch)
 			}
 		})
 	}
