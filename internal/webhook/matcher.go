@@ -21,12 +21,11 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	workloadsv1alpha1 "sigs.k8s.io/workload-class/api/v1alpha1"
+	"sigs.k8s.io/workload-class/internal/utils"
 )
 
 // bestMatchWorkloadClass finds the WorkloadClass that applies to a given Pod.
@@ -37,13 +36,18 @@ import (
 //
 // If no enforced class is defined on the Namespace, the active WorkloadClass in the Pod's
 // namespace whose PodSelector matches the Pod is selected (a nil PodSelector matches no Pods,
-// matching policy/v1 PDB selector semantics). WorkloadClasses marked with the SelectorOverlap
-// condition are skipped.
+// matching policy/v1 PDB selector semantics). If more than one WorkloadClass matches, the oldest
+// one wins (by creationTimestamp, then name), so creating a WorkloadClass never takes a Pod away
+// from the WorkloadClass that already governs it. Overlap is reported separately through the
+// informational PodSelectorOverlap condition.
+//
+// The selection rules are shared with the WorkloadClass controller (see utils.SelectorBestMatch), so that the
+// WorkloadClass enforced here is the one that owns the Pod's PodDisruptionBudget.
 //
 // If no matching or active enforced WorkloadClass is found, it returns nil.
 func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, pod *corev1.Pod) (*workloadsv1alpha1.WorkloadClass, error) {
 	// If the namespace defines an enforced WorkloadClass, it overrides PodSelector matching for the namespace.
-	if bestMatch, enforced := v.namespaceDefaultWorkloadClass(ctx, pod); enforced {
+	if bestMatch, enforced := v.namespaceEnforcedWorkloadClass(ctx, pod); enforced {
 		return bestMatch, nil
 	}
 
@@ -52,46 +56,19 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, pod *cor
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %w", err)
 	}
 
-	for i := range wcs.Items {
-		wc := &wcs.Items[i]
-		if !wc.DeletionTimestamp.IsZero() || hasSelectorOverlap(wc) {
-			continue
-		}
-		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
-		if err != nil {
-			continue
-		}
-		if selector.Matches(labels.Set(pod.Labels)) {
-			return wc, nil
-		}
-	}
-
-	return nil, nil
+	return utils.SelectorBestMatch(pod, wcs.Items), nil
 }
 
-func hasSelectorOverlap(wc *workloadsv1alpha1.WorkloadClass) bool {
-	for _, cond := range wc.Status.Conditions {
-		if cond.Type == workloadsv1alpha1.ConditionTypeValidated &&
-			cond.Status == metav1.ConditionFalse &&
-			cond.Reason == workloadsv1alpha1.ReasonSelectorOverlap {
-			return true
-		}
+// namespaceEnforcedWorkloadClass returns the WorkloadClass enforced by the Pod's Namespace (see
+// utils.NamespaceEnforcedWorkloadClass) and whether the Namespace enforces one.
+//
+// Errors are logged rather than returned: if the Namespace cannot be read, PodSelector matching is used; if the
+// enforced WorkloadClass cannot be read, no WorkloadClass applies to the Pod.
+func (v *DisruptionWebhook) namespaceEnforcedWorkloadClass(ctx context.Context, pod *corev1.Pod) (*workloadsv1alpha1.WorkloadClass, bool) {
+	wc, enforced, err := utils.NamespaceEnforcedWorkloadClass(ctx, v.Client, pod.Namespace)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to get namespace enforced WorkloadClass", "namespace", pod.Namespace)
+		return nil, enforced
 	}
-	return false
-}
-
-func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod) (*workloadsv1alpha1.WorkloadClass, bool) {
-	ns := &corev1.Namespace{}
-	if err := v.Client.Get(ctx, client.ObjectKey{Name: pod.Namespace}, ns); err == nil {
-		if defaultClass := ns.Labels[workloadsv1alpha1.EnforcedWorkloadClassLabel]; defaultClass != "" {
-			wc := &workloadsv1alpha1.WorkloadClass{}
-			if err := v.Client.Get(ctx, client.ObjectKey{Name: defaultClass, Namespace: pod.Namespace}, wc); err != nil {
-				logf.FromContext(ctx).Error(err, "Failed to get namespace enforced WorkloadClass", "namespace", pod.Namespace, "workloadClass", defaultClass)
-			} else if wc.DeletionTimestamp.IsZero() {
-				return wc, true
-			}
-			return nil, true
-		}
-	}
-	return nil, false
+	return wc, enforced
 }
