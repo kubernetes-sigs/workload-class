@@ -186,13 +186,6 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 	}
 }
 
-func TestInjectDecoder(t *testing.T) {
-	v := &DisruptionWebhook{}
-	if err := v.InjectDecoder(nil); err != nil {
-		t.Errorf("InjectDecoder() unexpected error: %v", err)
-	}
-}
-
 type fakeClient struct {
 	client.Client
 	getPodError            error

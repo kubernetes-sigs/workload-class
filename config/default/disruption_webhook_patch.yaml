@@ -1,0 +1,18 @@
+# Limits the DisruptionWebhook (pods/eviction) to namespaces other than kube-system and the controller's own namespace.
+#
+# Excluding the controller's namespace keeps a node drain from blocking on the webhook while the controller Pod
+# itself is being evicted. The kubebuilder webhook marker cannot express a namespaceSelector, so it is added here.
+# The second value ("system") is replaced with the controller's namespace by the replacement in kustomization.yaml.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- name: vpoddisruption.workloads.x-k8s.io
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: NotIn
+      values:
+      - kube-system
+      - system
