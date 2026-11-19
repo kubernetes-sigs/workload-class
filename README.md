@@ -83,7 +83,9 @@ Each PDB has a controller owner reference (`controller: true`, `blockOwnerDeleti
 
 A `WorkloadClass` that stops protecting Pods (for example, because it fails validation) opens the PDBs it owns for active Pods that no user-created PDB covers, instead of deleting them, as described in the table above.
 
-When a Pod's best-match `WorkloadClass` changes, for example because the namespace starts enforcing a class or the older of two overlapping `WorkloadClasses` is deleted, the new `WorkloadClass` takes ownership of the existing PDB rather than deleting and recreating it, so the Pod stays protected throughout the handover. The PDB is handed back the same way, for example when the `workloads.x-k8s.io/enforced-class` label is removed. If the new best match doesn't protect Pods, the previous `WorkloadClass` deletes the PDB instead.
+When a Pod's best-match `WorkloadClass` changes, for example because the namespace starts enforcing a class, the new `WorkloadClass` takes ownership of the existing PDB rather than deleting and recreating it, so the Pod stays protected throughout the handover. The PDB is handed back the same way, for example when the `workloads.x-k8s.io/enforced-class` label is removed. If the new best match doesn't protect Pods, the previous `WorkloadClass` deletes the PDB instead.
+
+When the older of two overlapping `WorkloadClasses` is deleted, the newer one becomes the best match of their shared Pods, but the PDBs aren't guaranteed to be handed over: the garbage collector may delete the PDBs owned by the deleted `WorkloadClass` before the newer one takes ownership of them. In that case, the newer `WorkloadClass` creates new PDBs for those Pods, which are briefly unprotected in between.
 
 The controller never modifies a user-created PDB, even one that happens to be named `workload-<pod name>`. If such a PDB doesn't cover the Pod, the Pod gets no managed PDB until the user-created PDB is changed or deleted.
 
@@ -91,7 +93,7 @@ The controller never modifies a user-created PDB, even one that happens to be na
 
 To manage Per-Pod PDBs, the controller's ClusterRole (generated into `config/rbac/role.yaml`) grants:
 
-- `patch` on `pods` (along with `list` and `watch`), to set the `workloads.x-k8s.io/pod-uid` label;
+- `patch` on `pods` (along with `get`, `list`, and `watch`), to set the `workloads.x-k8s.io/pod-uid` label;
 - `get`, `list`, `watch`, `create`, `update`, `patch`, and `delete` on `poddisruptionbudgets` in the `policy` API group.
 
 If you deploy the controller with your own RBAC, grant the same permissions.
