@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -104,12 +105,25 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 		Status: workloadsv1alpha1.WorkloadClassStatus{
 			Conditions: []metav1.Condition{
 				{
-					Type:   workloadsv1alpha1.ConditionTypeValidated,
-					Status: metav1.ConditionFalse,
+					Type:   workloadsv1alpha1.ConditionTypePodSelectorOverlap,
+					Status: metav1.ConditionTrue,
 					Reason: workloadsv1alpha1.ReasonSelectorOverlap,
 				},
 			},
 		},
+	}
+	older := metav1.NewTime(now.Add(-time.Hour))
+	wcOlder := workloadsv1alpha1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "wc-older", Namespace: testNamespace, CreationTimestamp: older},
+		Spec:       workloadsv1alpha1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{testLabelKeyB: testLabelValB}}},
+	}
+	wcNewer := workloadsv1alpha1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "wc-a-newer", Namespace: testNamespace, CreationTimestamp: now},
+		Spec:       workloadsv1alpha1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{testLabelKeyA: testLabelValA}}},
+	}
+	wcSameAgeB := workloadsv1alpha1.WorkloadClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "wc-b", Namespace: testNamespace, CreationTimestamp: older},
+		Spec:       workloadsv1alpha1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{testLabelKeyA: testLabelValA}}},
 	}
 	wcNilSelector := workloadsv1alpha1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "wc-nil-selector", Namespace: testNamespace},
@@ -154,9 +168,19 @@ func TestBestMatchWorkloadClass(t *testing.T) {
 			getNSResult:  nsNoDefault, wantBestMatch: &wc,
 		},
 		{
-			name:         "skips_wc_with_selector_overlap_condition",
+			name:         "keeps_enforcing_wc_with_selector_overlap_condition",
 			listWCResult: &workloadsv1alpha1.WorkloadClassList{Items: []workloadsv1alpha1.WorkloadClass{wcSelectorOverlap}},
-			getNSResult:  nsNoDefault, wantBestMatch: nil,
+			getNSResult:  nsNoDefault, wantBestMatch: &wcSelectorOverlap,
+		},
+		{
+			name:         "oldest_matching_wc_wins",
+			listWCResult: &workloadsv1alpha1.WorkloadClassList{Items: []workloadsv1alpha1.WorkloadClass{wcNewer, wcOlder}},
+			getNSResult:  nsNoDefault, wantBestMatch: &wcOlder,
+		},
+		{
+			name:         "equal_creation_timestamp_breaks_ties_by_name",
+			listWCResult: &workloadsv1alpha1.WorkloadClassList{Items: []workloadsv1alpha1.WorkloadClass{wcSameAgeB, wcOlder}},
+			getNSResult:  nsNoDefault, wantBestMatch: &wcSameAgeB,
 		},
 		{
 			name:         "nil_pod_selector_matches_nothing",

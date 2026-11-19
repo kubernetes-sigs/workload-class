@@ -307,6 +307,10 @@ func (in *WorkloadClassStatus) DeepCopyInto(out *WorkloadClassStatus) {
 		in, out := &in.LastDisruptionTime, &out.LastDisruptionTime
 		*out = (*in).DeepCopy()
 	}
+	if in.LastPodTerminationTime != nil {
+		in, out := &in.LastPodTerminationTime, &out.LastPodTerminationTime
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

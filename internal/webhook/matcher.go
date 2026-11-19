@@ -37,8 +37,10 @@ import (
 //
 // If no enforced class is defined on the Namespace, the active WorkloadClass in the Pod's
 // namespace whose PodSelector matches the Pod is selected (a nil PodSelector matches no Pods,
-// matching policy/v1 PDB selector semantics). WorkloadClasses marked with the SelectorOverlap
-// condition are skipped.
+// matching policy/v1 PDB selector semantics). If more than one WorkloadClass matches, the oldest
+// one wins (by creationTimestamp, then name), so creating a WorkloadClass never takes a Pod away
+// from the WorkloadClass that already governs it. Overlap is reported separately through the
+// informational PodSelectorOverlap condition.
 //
 // If no matching or active enforced WorkloadClass is found, it returns nil.
 func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, pod *corev1.Pod) (*workloadsv1alpha1.WorkloadClass, error) {
@@ -52,32 +54,30 @@ func (v *DisruptionWebhook) bestMatchWorkloadClass(ctx context.Context, pod *cor
 		return nil, fmt.Errorf("failed to list WorkloadClasses: %w", err)
 	}
 
+	var bestMatch *workloadsv1alpha1.WorkloadClass
 	for i := range wcs.Items {
 		wc := &wcs.Items[i]
-		if !wc.DeletionTimestamp.IsZero() || hasSelectorOverlap(wc) {
+		if !wc.DeletionTimestamp.IsZero() {
 			continue
 		}
 		selector, err := metav1.LabelSelectorAsSelector(wc.Spec.PodSelector)
 		if err != nil {
 			continue
 		}
-		if selector.Matches(labels.Set(pod.Labels)) {
-			return wc, nil
+		if selector.Matches(labels.Set(pod.Labels)) && (bestMatch == nil || olderWorkloadClass(wc, bestMatch)) {
+			bestMatch = wc
 		}
 	}
 
-	return nil, nil
+	return bestMatch, nil
 }
 
-func hasSelectorOverlap(wc *workloadsv1alpha1.WorkloadClass) bool {
-	for _, cond := range wc.Status.Conditions {
-		if cond.Type == workloadsv1alpha1.ConditionTypeValidated &&
-			cond.Status == metav1.ConditionFalse &&
-			cond.Reason == workloadsv1alpha1.ReasonSelectorOverlap {
-			return true
-		}
+// olderWorkloadClass reports whether a was created before b, breaking ties on equal creationTimestamp by name.
+func olderWorkloadClass(a, b *workloadsv1alpha1.WorkloadClass) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
 	}
-	return false
+	return a.Name < b.Name
 }
 
 func (v *DisruptionWebhook) namespaceDefaultWorkloadClass(ctx context.Context, pod *corev1.Pod) (*workloadsv1alpha1.WorkloadClass, bool) {
