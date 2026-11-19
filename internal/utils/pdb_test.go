@@ -238,6 +238,21 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 			wantLabels:         map[string]string{"team": "a", workloadsv1alpha1.PodUIDLabel: string(testPodUID)},
 			wantMaxUnavailable: &closed,
 		},
+		{
+			name: "clears_externally_set_min_available",
+			wc:   newWC(workloadsv1alpha1.ReadinessNotReady),
+			pod:  pod,
+			pdb: func() *policyv1.PodDisruptionBudget {
+				pdb := PDBBase(pod)
+				minAvailable := intstr.FromInt32(1)
+				pdb.Spec.MinAvailable = &minAvailable
+				return pdb
+			}(),
+			protects:           true,
+			wantName:           PDBName(testPodName),
+			wantLabels:         map[string]string{workloadsv1alpha1.PodUIDLabel: string(testPodUID)},
+			wantMaxUnavailable: &closed,
+		},
 	}
 
 	for _, tt := range tests {
@@ -263,6 +278,9 @@ func TestSyncPDBWithWorkloadClass(t *testing.T) {
 			}
 			if !reflect.DeepEqual(tt.pdb.Spec.MaxUnavailable, tt.wantMaxUnavailable) {
 				t.Errorf("SyncPDBWithWorkloadClass() MaxUnavailable = %v, want %v", tt.pdb.Spec.MaxUnavailable, tt.wantMaxUnavailable)
+			}
+			if tt.pdb.Spec.MinAvailable != nil {
+				t.Errorf("SyncPDBWithWorkloadClass() MinAvailable = %v, want nil", tt.pdb.Spec.MinAvailable)
 			}
 		})
 	}
