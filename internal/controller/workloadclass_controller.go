@@ -85,7 +85,7 @@ type WorkloadClassReconciler struct {
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclasses/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=workloads.x-k8s.io,resources=workloadclassguardrails,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=list;watch;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 
