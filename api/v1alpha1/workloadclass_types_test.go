@@ -79,17 +79,11 @@ func TestWorkloadClassDeepCopy(t *testing.T) {
 						EndTime:    "04:00",
 					},
 				},
-				AllowedDisruptionsOutsideOfWindow: []Subject{
-					{
-						Kind:      "ServiceAccount",
-						Name:      "vpa-updater",
-						Namespace: "kube-system",
-					},
-				},
-				MaxNonDisruptionDurationDays:    1,
-				MinInitialRunDurationDays:       2,
-				GraceTerminationDurationSeconds: 30,
-				EmergencyOverride:               false,
+				AllowedDisruptionsOutsideOfWindow: []DisruptionCause{DisruptionCauseVerticalPodAutoscaler},
+				MaxNonDisruptionDurationDays:      1,
+				MinInitialRunDurationDays:         2,
+				GraceTerminationDurationSeconds:   30,
+				EmergencyOverride:                 false,
 			},
 		},
 		Status: WorkloadClassStatus{
@@ -115,8 +109,8 @@ func TestWorkloadClassDeepCopy(t *testing.T) {
 		t.Error("modifying copied DaysOfWeek mutated original")
 	}
 
-	copied.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow[0].Name = "changed"
-	if orig.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow[0].Name != "vpa-updater" {
+	copied.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow[0] = DisruptionCauseClusterAutoscaler
+	if orig.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow[0] != DisruptionCauseVerticalPodAutoscaler {
 		t.Error("modifying copied AllowedDisruptionsOutsideOfWindow mutated original")
 	}
 
@@ -155,6 +149,14 @@ func TestWorkloadClassGuardrailDeepCopy(t *testing.T) {
 					EmergencyOverride:                false,
 				},
 			},
+			DisruptionCauses: []DisruptionCauseMapping{
+				{
+					Name: DisruptionCauseVerticalPodAutoscaler,
+					Subjects: []Subject{
+						{Kind: "ServiceAccount", Name: "vpa-updater", Namespace: "kube-system"},
+					},
+				},
+			},
 		},
 		Status: WorkloadClassGuardrailStatus{
 			Conditions: []metav1.Condition{
@@ -175,6 +177,11 @@ func TestWorkloadClassGuardrailDeepCopy(t *testing.T) {
 	copied.Spec.Constraints.Disruption.DaysOfWeek[0] = "Friday"
 	if orig.Spec.Constraints.Disruption.DaysOfWeek[0] != "Saturday" {
 		t.Error("modifying copied DaysOfWeek mutated original")
+	}
+
+	copied.Spec.DisruptionCauses[0].Subjects[0].Name = "changed"
+	if orig.Spec.DisruptionCauses[0].Subjects[0].Name != "vpa-updater" {
+		t.Error("modifying copied DisruptionCauses mutated original")
 	}
 
 	copied.Status.Conditions[0].Status = metav1.ConditionFalse

@@ -75,14 +75,20 @@ func (v *DisruptionWebhook) Handle(ctx context.Context, req admission.Request) a
 		}
 	}
 
-	// 5. Request-specific check: Identity-Based Filtering
-	for _, allowedSubject := range bestWC.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow {
-		allowed, err := matchesIdentity(req.UserInfo, allowedSubject)
-		if err != nil {
-			log.Error(err, "Failed to check if UserInfo matches allowed Subject", "subject", allowedSubject)
-		}
-		if allowed {
-			return admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", allowedSubject))
+	// 5. Request-specific check: Identity-Based Filtering. A WorkloadClassGuardrail maps each disruption cause the
+	// WorkloadClass allows outside of its windows to the identities that perform it.
+	if causes := bestWC.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow; len(causes) > 0 {
+		guardrails := &workloadsv1alpha1.WorkloadClassGuardrailList{}
+		if err := v.Client.List(ctx, guardrails); err != nil {
+			log.Error(err, "Failed to list WorkloadClassGuardrails to map disruption causes")
+		} else {
+			cause, subject, allowed, err := matchDisruptionCause(req.UserInfo, causes, guardrails.Items)
+			if err != nil {
+				log.Error(err, "Failed to check if UserInfo matches a disruption cause Subject")
+			}
+			if allowed {
+				return admission.Allowed(fmt.Sprintf("Disruption allowed for cause %s performed by %s", cause, formatSubject(subject)))
+			}
 		}
 	}
 

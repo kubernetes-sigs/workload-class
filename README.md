@@ -6,8 +6,8 @@ A high-level Kubernetes control layer for managing workload outcomes and disrupt
 
 `workload-class` provides a two-tier API under `workloads.x-k8s.io/v1alpha1` that allows platform administrators and workload owners to collaborate on managing workload disruptions during cluster maintenance:
 
-1. **`WorkloadClassGuardrail` (Cluster-scoped)**: Defined by platform engineers to enforce cluster-wide boundaries on disruption policies (such as allowed days of the week, maximum number of maintenance windows, and maximum non-disruption duration to prevent maintenance starvation).
-2. **`WorkloadClass` (Namespace-scoped)**: Defined by workload owners to declare pod disruption policies (temporal maintenance windows, minimum initial run duration, graceful termination cool-down, and outside-of-window subject exceptions) within platform guardrails.
+1. **`WorkloadClassGuardrail` (Cluster-scoped)**: Defined by platform engineers to enforce cluster-wide boundaries on disruption policies (such as allowed days of the week, maximum number of maintenance windows, and maximum non-disruption duration to prevent maintenance starvation), and to map portable disruption causes (such as `VerticalPodAutoscaler` or `ClusterAutoscaler`) to the users, groups, and ServiceAccounts that perform them in the cluster.
+2. **`WorkloadClass` (Namespace-scoped)**: Defined by workload owners to declare pod disruption policies (temporal maintenance windows, minimum initial run duration, graceful termination cool-down, and the disruption causes allowed outside of those windows) within platform guardrails.
 
 ### Pod Selection & Namespace Enforced Class Precedence
 

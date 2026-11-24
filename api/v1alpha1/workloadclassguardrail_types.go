@@ -58,6 +58,31 @@ type Disruption struct {
 type WorkloadClassGuardrailSpec struct {
 	// Constraints defines the guardrails for WorkloadClasses.
 	Constraints Constraints `json:"constraints"`
+
+	// DisruptionCauses maps the disruption causes that WorkloadClasses list in
+	// spec.disruptionPolicy.allowedDisruptionsOutsideOfWindow to the users, groups, and ServiceAccounts that perform
+	// them in this cluster. When more than one WorkloadClassGuardrail maps the same cause, the subjects of all of them
+	// perform it.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=64
+	// +optional
+	DisruptionCauses []DisruptionCauseMapping `json:"disruptionCauses,omitempty"`
+}
+
+// DisruptionCauseMapping maps a disruption cause to the identities that perform it.
+type DisruptionCauseMapping struct {
+	// Name is the disruption cause, as WorkloadClasses list it in allowedDisruptionsOutsideOfWindow.
+	// +required
+	Name DisruptionCause `json:"name"`
+
+	// Subjects are the users, groups, and ServiceAccounts whose evictions count as this cause.
+	// The list is atomic, like rbac/v1 RoleBinding subjects.
+	// +listType=atomic
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=32
+	// +required
+	Subjects []Subject `json:"subjects"`
 }
 
 // WorkloadClassGuardrailStatus defines the observed state of WorkloadClassGuardrail.
