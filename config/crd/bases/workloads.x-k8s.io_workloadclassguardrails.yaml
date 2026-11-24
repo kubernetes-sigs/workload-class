@@ -83,6 +83,69 @@ spec:
                 required:
                 - disruption
                 type: object
+              disruptionCauses:
+                description: |-
+                  DisruptionCauses maps the disruption causes that WorkloadClasses list in
+                  spec.disruptionPolicy.allowedDisruptionsOutsideOfWindow to the users, groups, and ServiceAccounts that perform
+                  them in this cluster. When more than one WorkloadClassGuardrail maps the same cause, the subjects of all of them
+                  perform it.
+                items:
+                  description: DisruptionCauseMapping maps a disruption cause to the
+                    identities that perform it.
+                  properties:
+                    name:
+                      description: Name is the disruption cause, as WorkloadClasses
+                        list it in allowedDisruptionsOutsideOfWindow.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[A-Z][A-Za-z0-9]*$
+                      type: string
+                    subjects:
+                      description: |-
+                        Subjects are the users, groups, and ServiceAccounts whose evictions count as this cause.
+                        The list is atomic, like rbac/v1 RoleBinding subjects.
+                      items:
+                        description: |-
+                          Subject defines the identity of a user, group, or service account.
+                          It is used to specify who or what is granted permissions or is the target
+                          of a policy. The structure aligns with standard Kubernetes RBAC subjects.
+                        properties:
+                          kind:
+                            description: Kind can be User, Group, or ServiceAccount
+                            enum:
+                            - User
+                            - Group
+                            - ServiceAccount
+                            type: string
+                          name:
+                            description: Name of the identity
+                            maxLength: 253
+                            minLength: 1
+                            type: string
+                          namespace:
+                            description: Namespace of the ServiceAccount (only for
+                              ServiceAccount kind)
+                            maxLength: 63
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      maxItems: 32
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-type: atomic
+                  required:
+                  - name
+                  - subjects
+                  type: object
+                maxItems: 64
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
             required:
             - constraints
             type: object

@@ -92,40 +92,25 @@ spec:
                     x-kubernetes-list-type: map
                   allowedDisruptionsOutsideOfWindow:
                     description: |-
-                      AllowedDisruptionsOutsideOfWindow specifies subjects that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
-                      The list is atomic, like rbac/v1 RoleBinding subjects: Subject.Namespace is optional, so it can't be a list map key,
-                      and keying on kind and name alone would reject two ServiceAccounts with the same name in different namespaces.
+                      AllowedDisruptionsOutsideOfWindow lists the causes of disruptions that are allowed even outside of
+                      AllowedDisruptionWindows (e.g. VerticalPodAutoscaler, ClusterAutoscaler).
+                      Causes don't depend on the cluster: platform administrators map each cause to the users, groups, and
+                      ServiceAccounts that perform it in their cluster with WorkloadClassGuardrail spec.disruptionCauses.
+                      A cause that no WorkloadClassGuardrail maps allows no disruptions.
                     items:
                       description: |-
-                        Subject defines the identity of a user, group, or service account.
-                        It is used to specify who or what is granted permissions or is the target
-                        of a policy. The structure aligns with standard Kubernetes RBAC subjects.
-                      properties:
-                        kind:
-                          description: Kind can be User, Group, or ServiceAccount
-                          enum:
-                          - User
-                          - Group
-                          - ServiceAccount
-                          type: string
-                        name:
-                          description: Name of the identity
-                          maxLength: 253
-                          minLength: 1
-                          type: string
-                        namespace:
-                          description: Namespace of the ServiceAccount (only for ServiceAccount
-                            kind)
-                          maxLength: 63
-                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
-                          type: string
-                      required:
-                      - kind
-                      - name
-                      type: object
-                      x-kubernetes-map-type: atomic
+                        DisruptionCause names a cause of Pod disruptions, such as an autoscaler or a node update, without naming the
+                        identity that performs it in a particular cluster or Kubernetes distribution. WorkloadClassGuardrail
+                        spec.disruptionCauses maps each cause to those identities.
+                        The well-known causes are VerticalPodAutoscaler, ClusterAutoscaler, DriverUpdate, and SecurityPatch; platform
+                        administrators can map other causes too.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[A-Z][A-Za-z0-9]*$
+                      type: string
+                    maxItems: 16
                     type: array
-                    x-kubernetes-list-type: atomic
+                    x-kubernetes-list-type: set
                   emergencyOverride:
                     description: EmergencyOverride allows bypassing all constraints
                       immediately.

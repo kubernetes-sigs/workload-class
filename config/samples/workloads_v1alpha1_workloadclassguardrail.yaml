@@ -10,3 +10,14 @@ spec:
         - Sunday
       maxAllowedWindows: 2
       maxNonDisruptionDurationDays: 30
+  disruptionCauses:
+    - name: VerticalPodAutoscaler
+      subjects:
+        - kind: ServiceAccount
+          name: vpa-updater
+          namespace: kube-system
+    - name: ClusterAutoscaler
+      subjects:
+        - kind: ServiceAccount
+          name: cluster-autoscaler
+          namespace: kube-system

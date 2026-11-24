@@ -31,12 +31,15 @@ type DisruptionPolicy struct {
 	// +optional
 	AllowedDisruptionWindows []DisruptionWindow `json:"allowedDisruptionWindows,omitempty"`
 
-	// AllowedDisruptionsOutsideOfWindow specifies subjects that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
-	// The list is atomic, like rbac/v1 RoleBinding subjects: Subject.Namespace is optional, so it can't be a list map key,
-	// and keying on kind and name alone would reject two ServiceAccounts with the same name in different namespaces.
-	// +listType=atomic
+	// AllowedDisruptionsOutsideOfWindow lists the causes of disruptions that are allowed even outside of
+	// AllowedDisruptionWindows (e.g. VerticalPodAutoscaler, ClusterAutoscaler).
+	// Causes don't depend on the cluster: platform administrators map each cause to the users, groups, and
+	// ServiceAccounts that perform it in their cluster with WorkloadClassGuardrail spec.disruptionCauses.
+	// A cause that no WorkloadClassGuardrail maps allows no disruptions.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=16
 	// +optional
-	AllowedDisruptionsOutsideOfWindow []Subject `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
+	AllowedDisruptionsOutsideOfWindow []DisruptionCause `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
 
 	// MaxNonDisruptionDurationDays is the maximum duration a workload can remain undisrupted.
 	// If exceeded, maintenance takes precedence over per-pod run-duration hints.
@@ -91,6 +94,27 @@ type DisruptionWindow struct {
 	// +kubebuilder:validation:Pattern=`^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$`
 	EndTime string `json:"endTime,omitempty"`
 }
+
+// DisruptionCause names a cause of Pod disruptions, such as an autoscaler or a node update, without naming the
+// identity that performs it in a particular cluster or Kubernetes distribution. WorkloadClassGuardrail
+// spec.disruptionCauses maps each cause to those identities.
+// The well-known causes are VerticalPodAutoscaler, ClusterAutoscaler, DriverUpdate, and SecurityPatch; platform
+// administrators can map other causes too.
+// +kubebuilder:validation:MinLength=1
+// +kubebuilder:validation:MaxLength=63
+// +kubebuilder:validation:Pattern=`^[A-Z][A-Za-z0-9]*$`
+type DisruptionCause string
+
+const (
+	// DisruptionCauseVerticalPodAutoscaler is a VerticalPodAutoscaler evicting Pods to apply new resource requests.
+	DisruptionCauseVerticalPodAutoscaler DisruptionCause = "VerticalPodAutoscaler"
+	// DisruptionCauseClusterAutoscaler is a cluster autoscaler draining a Node to scale the cluster down.
+	DisruptionCauseClusterAutoscaler DisruptionCause = "ClusterAutoscaler"
+	// DisruptionCauseDriverUpdate is a Node driver (e.g. GPU or storage driver) update draining a Node.
+	DisruptionCauseDriverUpdate DisruptionCause = "DriverUpdate"
+	// DisruptionCauseSecurityPatch is a security patch draining a Node.
+	DisruptionCauseSecurityPatch DisruptionCause = "SecurityPatch"
+)
 
 // Subject defines the identity of a user, group, or service account.
 // It is used to specify who or what is granted permissions or is the target

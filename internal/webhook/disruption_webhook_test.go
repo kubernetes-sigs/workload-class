@@ -44,10 +44,24 @@ func TestHandle(t *testing.T) {
 		Spec: workloadsv1alpha1.WorkloadClassSpec{
 			PodSelector: &metav1.LabelSelector{MatchLabels: labels},
 			DisruptionPolicy: workloadsv1alpha1.DisruptionPolicy{
-				AllowedDisruptionsOutsideOfWindow: []workloadsv1alpha1.Subject{{Kind: rbacv1.UserKind, Name: adminUsername}},
+				AllowedDisruptionsOutsideOfWindow: []workloadsv1alpha1.DisruptionCause{workloadsv1alpha1.DisruptionCauseVerticalPodAutoscaler},
 			},
 		},
 	}
+	// wcUnmappedCause allows a disruption cause that no WorkloadClassGuardrail maps.
+	wcUnmappedCause := wc.DeepCopy()
+	wcUnmappedCause.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow = []workloadsv1alpha1.DisruptionCause{
+		workloadsv1alpha1.DisruptionCauseClusterAutoscaler,
+	}
+	adminSubject := workloadsv1alpha1.Subject{Kind: rbacv1.UserKind, Name: adminUsername}
+	guardrails := &workloadsv1alpha1.WorkloadClassGuardrailList{Items: []workloadsv1alpha1.WorkloadClassGuardrail{{
+		Spec: workloadsv1alpha1.WorkloadClassGuardrailSpec{
+			DisruptionCauses: []workloadsv1alpha1.DisruptionCauseMapping{{
+				Name:     workloadsv1alpha1.DisruptionCauseVerticalPodAutoscaler,
+				Subjects: []workloadsv1alpha1.Subject{adminSubject},
+			}},
+		},
+	}}}
 	wcValFailed := &workloadsv1alpha1.WorkloadClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "wc", Namespace: testNamespace},
 		Spec:       workloadsv1alpha1.WorkloadClassSpec{PodSelector: &metav1.LabelSelector{MatchLabels: labels}},
@@ -84,14 +98,15 @@ func TestHandle(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name      string
-		req       admissionv1.AdmissionRequest
-		getPodErr error
-		listWCErr error
-		getWCErr  error
-		getWCResp *workloadsv1alpha1.WorkloadClass
-		readiness workloadsv1alpha1.MaintenanceReadiness
-		want      admission.Response
+		name              string
+		req               admissionv1.AdmissionRequest
+		getPodErr         error
+		listWCErr         error
+		getWCErr          error
+		listGuardrailsErr error
+		getWCResp         *workloadsv1alpha1.WorkloadClass
+		readiness         workloadsv1alpha1.MaintenanceReadiness
+		want              admission.Response
 	}{
 		{
 			name: "errorGettingPod", req: evictionRequest, getPodErr: fmt.Errorf("error getting Pod"),
@@ -122,7 +137,17 @@ func TestHandle(t *testing.T) {
 		{
 			name: "allowedUser", req: evictionRequest, getWCResp: wc,
 			readiness: workloadsv1alpha1.ReadinessNotReady,
-			want:      admission.Allowed(fmt.Sprintf("Disruption allowed for authorized user: %s", wc.Spec.DisruptionPolicy.AllowedDisruptionsOutsideOfWindow[0])),
+			want:      admission.Allowed("Disruption allowed for cause VerticalPodAutoscaler performed by User " + adminUsername),
+		},
+		{
+			name: "causeNotMappedByAnyGuardrail", req: evictionRequest, getWCResp: wcUnmappedCause,
+			readiness: workloadsv1alpha1.ReadinessNotReady,
+			want:      admission.Denied(fmt.Sprintf("Eviction blocked: WorkloadClass %s is not ready for maintenance", wc.Name)),
+		},
+		{
+			name: "errorListingGuardrails", req: evictionRequest, getWCResp: wc,
+			listGuardrailsErr: fmt.Errorf("error listing WorkloadClassGuardrails"), readiness: workloadsv1alpha1.ReadinessNotReady,
+			want: admission.Denied(fmt.Sprintf("Eviction blocked: WorkloadClass %s is not ready for maintenance", wc.Name)),
 		},
 		{
 			name: "overdue", req: evictionRequestNonMatchingUser,
@@ -157,7 +182,11 @@ func TestHandle(t *testing.T) {
 				listResp.Items = []workloadsv1alpha1.WorkloadClass{*wcCopy}
 			}
 
-			v := &DisruptionWebhook{Client: createClient(nil, tc.getWCErr, tc.listWCErr, tc.getPodErr, nsNoAnnotation, wcCopy, listResp, pod)}
+			v := &DisruptionWebhook{Client: guardrailClient{
+				fakeClient: createClient(nil, tc.getWCErr, tc.listWCErr, tc.getPodErr, nsNoAnnotation, wcCopy, listResp, pod),
+				guardrails: guardrails,
+				listErr:    tc.listGuardrailsErr,
+			}}
 			admissionResponse := v.Handle(ctx, admission.Request{AdmissionRequest: tc.req})
 
 			if admissionResponse.Allowed != tc.want.Allowed {
