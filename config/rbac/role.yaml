@@ -7,13 +7,6 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - ""
-  resources:
   - namespaces
   - pods
   verbs:
@@ -24,6 +17,13 @@ rules:
   - workloads.x-k8s.io
   resources:
   - workloadclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - workloads.x-k8s.io
+  resources:
   - workloadclassguardrails
   verbs:
   - create
@@ -36,14 +36,12 @@ rules:
 - apiGroups:
   - workloads.x-k8s.io
   resources:
-  - workloadclasses/finalizers
   - workloadclassguardrails/finalizers
   verbs:
   - update
 - apiGroups:
   - workloads.x-k8s.io
   resources:
-  - workloadclasses/status
   - workloadclassguardrails/status
   verbs:
   - get
