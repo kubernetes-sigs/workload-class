@@ -69,6 +69,7 @@ var _ = Describe("DisruptionWebhook", func() {
 			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "registry.k8s.io/pause:3.10"}}},
 		}
 		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		waitForCached(pod)
 		return pod
 	}
 
@@ -157,7 +158,12 @@ var _ = Describe("DisruptionWebhook", func() {
 		Expect(found.FailurePolicy).To(HaveValue(Equal(admissionregistrationv1.Ignore)))
 		Expect(found.TimeoutSeconds).To(HaveValue(BeEquivalentTo(5)))
 		Expect(found.SideEffects).To(HaveValue(Equal(admissionregistrationv1.SideEffectClassNone)))
-		Expect(found.Rules).To(ConsistOf(HaveField("Rule.Resources", ConsistOf("pods/eviction"))))
+		Expect(found.Rules).To(ConsistOf(SatisfyAll(
+			HaveField("Operations", ConsistOf(admissionregistrationv1.Create)),
+			HaveField("Rule.APIGroups", ConsistOf("")),
+			HaveField("Rule.APIVersions", ConsistOf("v1")),
+			HaveField("Rule.Resources", ConsistOf("pods/eviction")),
+		)))
 	})
 
 	It("allows evicting a Pod that no WorkloadClass selects", func() {
@@ -176,16 +182,19 @@ var _ = Describe("DisruptionWebhook", func() {
 		By("denying without a MaintenanceAllowed message")
 		meta.RemoveStatusCondition(&wc.Status.Conditions, conditionTypeMaintenanceAllowed)
 		Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+		waitForCached(wc)
 		expectDenied(k8sClient, pod, "WorkloadClass web is not ready for maintenance")
 
 		By("allowing while Ready")
 		wc.Status.MaintenanceReadiness = workloadsv1alpha1.ReadinessReady
 		Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+		waitForCached(wc)
 		expectAllowed(k8sClient, pod)
 
 		By("allowing while Overdue")
 		wc.Status.MaintenanceReadiness = workloadsv1alpha1.ReadinessOverdue
 		Expect(k8sClient.Status().Update(ctx, wc)).To(Succeed())
+		waitForCached(wc)
 		expectAllowed(k8sClient, pod)
 	})
 

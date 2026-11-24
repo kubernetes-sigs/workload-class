@@ -119,6 +119,10 @@ var _ = BeforeSuite(func() {
 		}
 		return conn.Close()
 	}).Should(Succeed())
+
+	// Confirm the Pod, Namespace, and WorkloadClass informers pre-registered by SetupDisruptionWebhookWithManager
+	// have synced before the specs run.
+	Expect(mgr.GetCache().WaitForCacheSync(ctx)).To(BeTrue())
 })
 
 var _ = AfterSuite(func() {

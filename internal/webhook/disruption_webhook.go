@@ -43,7 +43,10 @@ const DisruptionWebhookPath = "/validate-disruption"
 // failurePolicy is Ignore: if the webhook cannot be reached (e.g. the controller is down or being rolled out), the
 // API server admits the eviction instead of rejecting every eviction in the cluster, which would block node drains,
 // node upgrades, and cluster autoscaler scale-down. The Per-Pod PodDisruptionBudgets managed by the WorkloadClass
-// controller keep enforcing the disruption policy while the webhook is unavailable.
+// controller keep enforcing the disruption policy while the webhook is unavailable. Pods without a controller-managed
+// Per-Pod PodDisruptionBudget lose disruption-window enforcement while the webhook is unavailable: Pods covered by a
+// user-created PodDisruptionBudget (which do not get a Per-Pod PodDisruptionBudget) and newly created Pods that the
+// controller has not yet reconciled.
 //
 // The namespaceSelector that excludes kube-system and the controller's own namespace (so that draining the node of
 // the controller Pod cannot deadlock on the webhook) is added in config/default, since the marker cannot express it.

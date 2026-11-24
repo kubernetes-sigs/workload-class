@@ -57,9 +57,23 @@ patches:
 # Scope the pods/eviction DisruptionWebhook to every namespace except kube-system and the controller's namespace.
 - path: disruption_webhook_patch.yaml
 
+replacements:
+# [WEBHOOK] Exclude the controller's own namespace from the pods/eviction DisruptionWebhook
+# (disruption_webhook_patch.yaml). This is kept separate from the [CERTMANAGER] replacements below so that the
+# "system" placeholder is still replaced when cert-manager is disabled.
+ - source:
+     kind: Service
+     version: v1
+     name: webhook-service
+     fieldPath: .metadata.namespace
+   targets:
+     - select:
+         kind: ValidatingWebhookConfiguration
+       fieldPaths:
+         - webhooks.[name=vpoddisruption.workloads.x-k8s.io].namespaceSelector.matchExpressions.0.values.1
+
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER' prefix.
 # Uncomment the following replacements to add the cert-manager CA injection annotations
-replacements:
  - source: # Uncomment the following block to enable certificates for metrics
      kind: Service
      version: v1
@@ -156,11 +170,6 @@ replacements:
          delimiter: '.'
          index: 1
          create: true
-     # Exclude the controller's own namespace from the pods/eviction DisruptionWebhook (disruption_webhook_patch.yaml).
-     - select:
-         kind: ValidatingWebhookConfiguration
-       fieldPaths:
-         - webhooks.[name=vpoddisruption.workloads.x-k8s.io].namespaceSelector.matchExpressions.0.values.1
 
  - source: # Uncomment the following block if you have a ValidatingWebhook (--programmatic-validation)
      kind: Certificate
