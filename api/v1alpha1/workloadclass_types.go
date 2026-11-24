@@ -32,9 +32,9 @@ type DisruptionPolicy struct {
 	AllowedDisruptionWindows []DisruptionWindow `json:"allowedDisruptionWindows,omitempty"`
 
 	// AllowedDisruptionsOutsideOfWindow specifies subjects that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
-	// +listType=map
-	// +listMapKey=kind
-	// +listMapKey=name
+	// The list is atomic, like rbac/v1 RoleBinding subjects: Subject.Namespace is optional, so it can't be a list map key,
+	// and keying on kind and name alone would reject two ServiceAccounts with the same name in different namespaces.
+	// +listType=atomic
 	// +optional
 	AllowedDisruptionsOutsideOfWindow []Subject `json:"allowedDisruptionsOutsideOfWindow,omitempty"`
 
@@ -95,6 +95,7 @@ type DisruptionWindow struct {
 // Subject defines the identity of a user, group, or service account.
 // It is used to specify who or what is granted permissions or is the target
 // of a policy. The structure aligns with standard Kubernetes RBAC subjects.
+// +structType=atomic
 type Subject struct {
 	// Kind can be User, Group, or ServiceAccount
 	// +kubebuilder:validation:Required

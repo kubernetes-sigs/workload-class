@@ -91,8 +91,10 @@ spec:
                     - name
                     x-kubernetes-list-type: map
                   allowedDisruptionsOutsideOfWindow:
-                    description: AllowedDisruptionsOutsideOfWindow specifies subjects
-                      that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
+                    description: |-
+                      AllowedDisruptionsOutsideOfWindow specifies subjects that can disrupt even outside of windows. (e.g. VPA, ClusterAutoscaler)
+                      The list is atomic, like rbac/v1 RoleBinding subjects: Subject.Namespace is optional, so it can't be a list map key,
+                      and keying on kind and name alone would reject two ServiceAccounts with the same name in different namespaces.
                     items:
                       description: |-
                         Subject defines the identity of a user, group, or service account.
@@ -121,11 +123,9 @@ spec:
                       - kind
                       - name
                       type: object
+                      x-kubernetes-map-type: atomic
                     type: array
-                    x-kubernetes-list-map-keys:
-                    - kind
-                    - name
-                    x-kubernetes-list-type: map
+                    x-kubernetes-list-type: atomic
                   emergencyOverride:
                     description: EmergencyOverride allows bypassing all constraints
                       immediately.
